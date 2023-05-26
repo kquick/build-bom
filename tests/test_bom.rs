@@ -198,6 +198,7 @@ fn test_zlib() -> anyhow::Result<()> {
                                     verbose: false,
                                     strict: false,
                                     command: cmd_opts,
+                                    preproc_native: false,
                                     any_fail: false };
     // n.b. any_fail must be false because zlib runs autoconf/configure and the
     // failures there are tallied and cause build-bom to exit with a failure.
@@ -245,6 +246,7 @@ fn test_no_compile_only() -> anyhow::Result<()> {
                                     verbose: true,
                                     strict: false,
                                     command: cmd_opts,
+                                    preproc_native: false,
                                     any_fail: true };
     gen_bitcode(gen_opts)?;
     eprintln!("## bitcode generation complete");
@@ -295,7 +297,7 @@ fn test_blddir() -> anyhow::Result<()> {
                                     remove_arguments: Vec::new(),
                                     verbose: true,
                                     strict: true,
-                                    // preproc_native: true,
+                                    preproc_native: true,
                                     command: cmd_opts,
                                     any_fail : true };
     gen_bitcode(gen_opts)?;

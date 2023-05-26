@@ -45,6 +45,8 @@ pub struct BitcodeOptions {
     pub command : Vec<String>,
     #[structopt(long="strict", help="Generate bitcode that strictly adheres to the target object code (optimization levels, target architecture, etc.).")]
     pub strict : bool,
+    #[structopt(long="preproc-native", short="E", help="Pre-process with native compiler before generating bitcode.  This can be helpful for customized native compilers.")]
+    pub preproc_native : bool,
 
     // The following is for testing only: if set, it will fail if any portion of
     // the generate_bitcode operations fail.  In normal operation, this is false

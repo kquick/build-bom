@@ -192,6 +192,7 @@ fn test_zlib() -> anyhow::Result<()> {
 
     let cmd_opts = vec![String::from("make")];
     let gen_opts = BitcodeOptions { clang_path: user_clang_cmd(),
+                                    objcopy_path: None,
                                     suppress_automatic_debug: false,
                                     inject_arguments: Vec::new(),
                                     remove_arguments: Vec::new(),
@@ -240,6 +241,7 @@ fn test_no_compile_only() -> anyhow::Result<()> {
     eprintln!("## build-bom generate bitcode via make and clang at {:?}", user_clang_cmd());
     let cmd_opts = vec![String::from("make")];
     let gen_opts = BitcodeOptions { clang_path: user_clang_cmd(),
+                                    objcopy_path: None,
                                     suppress_automatic_debug: false,
                                     inject_arguments: Vec::new(),
                                     remove_arguments: Vec::new(),
@@ -292,6 +294,7 @@ fn test_blddir() -> anyhow::Result<()> {
     eprintln!("## build-bom generate bitcode via make and clang at {:?}", user_clang_cmd());
     let cmd_opts = vec![String::from("make")];
     let gen_opts = BitcodeOptions { clang_path: user_clang_cmd(),
+                                    objcopy_path: None,
                                     suppress_automatic_debug: false,
                                     inject_arguments: Vec::new(),
                                     remove_arguments: Vec::new(),

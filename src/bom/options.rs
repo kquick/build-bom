@@ -33,6 +33,8 @@ pub struct ExtractOptions {
 pub struct BitcodeOptions {
     #[structopt(long="clang", help="Name of the clang binary to use to generate bitcode (default: `clang`)")]
     pub clang_path : Option<PathBuf>,
+    #[structopt(long="objcopy", help="Name of the objcopy binary to use to when generating bitcode (default: `objcopy`)")]
+    pub objcopy_path : Option<PathBuf>,
     #[structopt(short="v", long="verbose", help="Generate verbose output")]
     pub verbose : bool,
     #[structopt(long="suppress-automatic-debug", help="Prevent `build-bom` from automatically injecting flags to generate debug information in bitcode files")]

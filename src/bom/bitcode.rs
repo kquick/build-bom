@@ -110,6 +110,8 @@ pub enum TracerError {
 struct BCOpts<'a> {
     /// The clang command to use to generate bitcode
     clang_path : &'a OsString,
+    /// The objcopy command to use when generating bitcode
+    objcopy_path : &'a OsString,
     /// If true, do *not* force the generation of debug information
     suppress_automatic_debug : bool,
     /// Arguments to inject when building bitcode
@@ -164,8 +166,14 @@ pub fn bitcode_entrypoint(bitcode_options : &BitcodeOptions) -> anyhow::Result<i
     let rx_strs = bitcode_options.remove_arguments.iter().map(|rx| rx.as_str());
     let remove_rx = RegexSet::new(rx_strs)?;
 
-    let bc_opts = BCOpts { clang_path : &bitcode_options.clang_path.as_ref().map(|s| OsString::from(s.as_path().as_os_str()))
-                                                        .unwrap_or(OsString::from("clang")),
+    let path_def =
+        |p: &Option<PathBuf>, d:&str|
+        p.as_ref().map(OsString::from).unwrap_or(d.into());
+
+    let bc_opts = BCOpts { clang_path : &path_def(&bitcode_options.clang_path,
+                                                  "clang"),
+                           objcopy_path : &path_def(&bitcode_options.objcopy_path,
+                                                    "objcopy"),
                            suppress_automatic_debug : bitcode_options.suppress_automatic_debug,
                            inject_arguments : &bitcode_options.inject_arguments,
                            remove_arguments : &remove_rx,
@@ -470,7 +478,7 @@ fn build_bitcode_compile_only(chan : &mut mpsc::Sender<Option<Event>>,
             if !obj_already_has_bitcode(cwd, &fstr) {
                 let _res = chan.send(Some(Event::BitcodeGenerationAttempts));
                 let bctarget = bc_args.resolved_object_target.clone();
-                attach_bitcode(cwd, &mut bc_args, &bctarget)?;
+                attach_bitcode(cwd, &bc_opts, &mut bc_args, &bctarget)?;
                 let ops_result = bc_args.ops.execute(&Some(cwd));
                 match ops_result {
                     Err(e) => {
@@ -648,10 +656,11 @@ fn obj_already_has_bitcode(cwd : &Path, obj_target : &OsString) -> bool {
 
 /// Given the name (path) of a tar file on disk, use objcopy to inject it into
 /// the distinguished ELF section for holding the bitcode (see `ELF_SECTION_NAME`)
-fn inject_bitcode(bc_args : &mut BitcodeArguments) -> anyhow::Result<()> {
+fn inject_bitcode(bc_opts : &BCOpts,
+                  bc_args : &mut BitcodeArguments) -> anyhow::Result<()> {
     let objcopy = bc_args.ops.push_op(
         SubProcOperation::new(
-            &"objcopy",
+            &bc_opts.objcopy_path,
             &FileSpec::Replace(String::from("INPFILE"), NamedFile::temp("")),
             &FileSpec::Append(NamedFile::temp(".o"))));
 
@@ -696,6 +705,7 @@ fn build_bitcode_tar<T: Write>(bc_target : &OsString,
 /// that we can generate appropriate commands (in terms of absolute paths) so
 /// that we don't need to worry about where we are replaying the build from.
 fn attach_bitcode(cwd : &Path,
+                  bc_opts : &BCOpts,
                   bc_args : &mut BitcodeArguments,
                   bc_target : &OsString) -> anyhow::Result<()> {
     let mktar = bc_args.ops.push_op(
@@ -726,7 +736,7 @@ fn attach_bitcode(cwd : &Path,
         mktar.push_arg(hex::encode(hash.as_slice()));
     }
 
-    inject_bitcode(bc_args)
+    inject_bitcode(bc_opts, bc_args)
 }
 
 pub const ELF_SECTION_NAME : &str = ".llvm_bitcode";
@@ -1207,6 +1217,7 @@ mod tests {
         bcdir.push("to");
         bcdir.push("bitcode");
         let bcopts = BCOpts { clang_path: &"/path/to/clang".into(),
+                              objcopy_path: &"/path/to/objcopy".into(),
                               suppress_automatic_debug: false,
                               inject_arguments: &Vec::from(
                                   [ "-arg1",

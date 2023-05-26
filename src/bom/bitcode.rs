@@ -312,7 +312,20 @@ fn build_bitcode_arguments(chan : &mut mpsc::Sender<Option<Event>>,
         // generated on a parallel effort and it is not being used for the final
         // executable, these internal directives can be nullified to get valid
         // bitcode with a minimal loss of information in that bitcode.
-        gen_bitcode.push_arg("-D__malloc__(X,Y)=");
+        //
+        // If --strict is set, these are not applied and must be done manually
+        // via --inject-argument="-D..." if still needed.
+        if !bc_opts.strict {
+            gen_bitcode.push_arg("-D__malloc__(X,Y)=");
+            gen_bitcode.push_arg("-D__atomic_store(X,Y,Z)=");
+            gen_bitcode.push_arg("-D__atomic_fetch_add(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_fetch_sub(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_fetch_and(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_fetch_or(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_compare_exchange(A,B,C,D,E,F)=0");
+            gen_bitcode.push_arg("-D__atomic_exchange(A,B,C,D)=0");
+            gen_bitcode.push_arg("-D__atomic_load(A,B,C)=0");
+        }
     } else {
         preprocess.disable();
     };
@@ -1321,7 +1334,6 @@ mod tests {
                                 { cmd: \"/path/to/clang\", \
                                   args: [\"-emit-llvm\", \
                                          \"-c\", \
-                                         \"-D__malloc__(X,Y)=\", \
                                          \"-g\", \
                                          \"-Wno-error=unused-command-line-argument\", \
                                          \"-arg1\", \
@@ -1347,8 +1359,69 @@ mod tests {
             }
         }
 
+        // Simple cmdline specification, non-strict, native preprocessing
+        let bcopts_preproc = BCOpts { native_preproc: true, ..bcopts };
+        let bcargs2 = build_bitcode_arguments(&mut sender, &bcopts_preproc,
+                                              &OsString::from("c"), &args);
+        match bcargs2 {
+            Err(e) => assert_eq!(e.to_string(), "<no error expected>"),
+            Ok(a) => {
+                assert_eq!(format!("{:?}", a.ops),
+                           "ChainedSubProcOperations \
+                            { chain: [\
+                                SubProcOperation \
+                                { cmd: \"c\", \
+                                  args: [\"-E\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-I\", \"src/include\", \
+                                         \"-DDebug\", \
+                                         \"bar.c\"], \
+                                  inp_file: Unneeded, \
+                                  out_file: Option(\"-o\", Temp(\".c\")), \
+                                  in_dir: None \
+                                }, \
+                                SubProcOperation \
+                                { cmd: \"/path/to/clang\", \
+                                  args: [\"-emit-llvm\", \
+                                         \"-c\", \
+                                         \"-D__malloc__(X,Y)=\", \
+                                         \"-D__atomic_store(X,Y,Z)=\", \
+                                         \"-D__atomic_fetch_add(X,Y,Z)=0\", \
+                                         \"-D__atomic_fetch_sub(X,Y,Z)=0\", \
+                                         \"-D__atomic_fetch_and(X,Y,Z)=0\", \
+                                         \"-D__atomic_fetch_or(X,Y,Z)=0\", \
+                                         \"-D__atomic_compare_exchange(A,B,C,D,E,F)=0\", \
+                                         \"-D__atomic_exchange(A,B,C,D)=0\", \
+                                         \"-D__atomic_load(A,B,C)=0\", \
+                                         \"-g\", \
+                                         \"-O0\", \
+                                         \"-Wno-error=unused-command-line-argument\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-I\", \"src/include\", \
+                                         \"-DDebug\"], \
+                                  inp_file: Append(TBD), \
+                                  out_file: Option(\"-o\", Temp(\".bc\")), \
+                                  in_dir: None \
+                                }], \
+                              initial_inp_file: None, \
+                              final_out_file: Some(\"foo.obj\"), \
+                              disabled: [] \
+                            }");
+                assert_eq!(a.resolved_object_target, "foo.obj");
+                let chan_out = receiver.try_recv();
+                assert!(chan_out.is_err());
+                assert_eq!(chan_out.err(), Some(mpsc::TryRecvError::Empty));
+            }
+        }
+
         // Alternate cmdline specification
-        let bcargs2 = build_bitcode_arguments(&mut sender, &bcopts,
+        let bcargs3 = build_bitcode_arguments(&mut sender, &bcopts,
                                               &OsString::from("clang"),
                                               &[ "-ofoo.obj",
                                                    "-remove",
@@ -1357,7 +1430,7 @@ mod tests {
                                                    "-DDebug",
                                                    "bar.cc"
                                               ].map(|s| s.into()));
-        match bcargs2 {
+        match bcargs3 {
             Err(e) => assert_eq!(e.to_string(), "<no error expected>"),
             Ok(a) => {
                 assert_eq!(format!("{:?}", a.ops),

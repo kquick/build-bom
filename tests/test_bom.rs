@@ -246,7 +246,7 @@ fn test_no_compile_only() -> anyhow::Result<()> {
                                     inject_arguments: Vec::new(),
                                     remove_arguments: Vec::new(),
                                     verbose: true,
-                                    strict: false,
+                                    strict: true,
                                     command: cmd_opts,
                                     preproc_native: false,
                                     any_fail: true };
@@ -299,7 +299,7 @@ fn test_blddir() -> anyhow::Result<()> {
                                     inject_arguments: Vec::new(),
                                     remove_arguments: Vec::new(),
                                     verbose: true,
-                                    strict: true,
+                                    strict: false,
                                     preproc_native: true,
                                     command: cmd_opts,
                                     any_fail : true };

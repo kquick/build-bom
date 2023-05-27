@@ -89,7 +89,7 @@ use std::thread;
 use sha2::{Digest,Sha256};
 use thiserror::Error;
 
-use crate::bom::options::{BitcodeOptions};
+use crate::bom::options::{BitcodeOptions, path_def};
 use crate::bom::syscalls::load_syscalls;
 use crate::bom::event::RawString;
 use crate::bom::proc_read::{read_str_from,read_str_list_from,read_environment,read_cwd};
@@ -165,10 +165,6 @@ pub fn bitcode_entrypoint(bitcode_options : &BitcodeOptions) -> anyhow::Result<i
     // here.
     let rx_strs = bitcode_options.remove_arguments.iter().map(|rx| rx.as_str());
     let remove_rx = RegexSet::new(rx_strs)?;
-
-    let path_def =
-        |p: &Option<PathBuf>, d:&str|
-        p.as_ref().map(OsString::from).unwrap_or(d.into());
 
     let bc_opts = BCOpts { clang_path : &path_def(&bitcode_options.clang_path,
                                                   "clang"),

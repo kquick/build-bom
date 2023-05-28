@@ -121,6 +121,9 @@ struct BCOpts<'a> {
     /// Strict: maintain strict adherence between the bitcode and the target code
     /// (optimization, target architecture, etc.)
     strict : bool,
+    /// If true, use the native compiler to pre-process the code before
+    /// generating the bitcode with clang.
+    native_preproc : bool,
     /// If true, echo executed commands to stdout
     echo_verbose : bool,
 }
@@ -173,6 +176,7 @@ pub fn bitcode_entrypoint(bitcode_options : &BitcodeOptions) -> anyhow::Result<i
                            inject_arguments : &bitcode_options.inject_arguments,
                            remove_arguments : &remove_rx,
                            strict : bitcode_options.strict,
+                           native_preproc : bitcode_options.preproc_native,
                            echo_verbose : bitcode_options.verbose,
     };
     let ptracer1 = generate_bitcode(&mut sender, ptracer, &bc_opts)?;
@@ -224,7 +228,17 @@ struct BitcodeArguments {
 }
 
 /// Given original arguments (excluding argv[0]), construct the command line we
-/// will pass to clang to build bitcode
+/// will pass to clang to build bitcode.  This will occur in one of two ways:
+///
+///  1) call clang with all arguments from the original compile command except
+///     those that are blacklisted (and whitelisted unless --strict) and with
+///     additional flags to emit LLVM bitcode instead of object code.
+///
+///  2) if native_preproc is true, call the original compiler with most original
+///     compile arguments (except those that are blacklisted and, if not
+///     --strict, whitelisted) and pass -E to run the pre-processor only.  Then
+///     run the clang bitcode generation (with only those arguments relating to
+///     code generation) on that pre-processor output.
 ///
 /// This handles removing flags that clang can't handle (or that we definitely
 /// do not want for bitcode generation), as well as transforming the output file
@@ -236,12 +250,49 @@ fn build_bitcode_arguments(chan : &mut mpsc::Sender<Option<Event>>,
     let mut orig_target = None;
     let ops = ChainedSubOps::new();
 
-    let gen_bitcode = ops.push_op(
+    let preprocess = ops.push_op(
         SubProcOperation::new(
-            &bc_opts.clang_path,
+            orig_compiler_cmd,
             // Input file specification is not necessary: these will be collected
             // from the orig_args as they are processed.
             &FileSpec::Unneeded,
+            // The output file used here will be the input file for the next
+            // stage, and the file extension will determine the default language
+            // (.c=C or .cc=C++).  Originally the thinking was that a .cc
+            // extension could always be used because C is a valid subset of
+            // C++... except that is no longer true:
+            //
+            // char* greeting() { return "hello, world"; }
+            //
+            // The above is perfectly acceptable C, but if compile as C++ it
+            // yields: error: ISO C++11 does not allow conversion from string
+            // literal to 'char*'.
+            //
+            // Thus, the following tries to determine whether to use a .c or .cc
+            // suffix for this intermediate file.
+            &FileSpec::Option(
+                String::from("-o"),
+                NamedFile::temp(orig_args.iter()
+                                .find(
+                                    |&arg| arg.to_str()
+                                        .map(|a| !a.starts_with("-") &&
+                                             (a.ends_with(".cc") ||
+                                              a.ends_with(".cpp")))
+                                        .unwrap_or_else(|| false))
+                                .map(|_| ".cc")
+                                .unwrap_or(".c")))));
+    preprocess.push_arg("-E");
+
+    let gen_bitcode = ops.push_op(
+        SubProcOperation::new(
+            &bc_opts.clang_path,
+            if bc_opts.native_preproc {
+                &FileSpec::Append(NamedFile::TBD)
+            } else {
+                // Input file specification is not necessary: these will be
+                // collected from the orig_args as they are processed.
+                &FileSpec::Unneeded
+            },
             &FileSpec::Option(String::from("-o"), NamedFile::temp(".bc"))));
 
     // We always need to add this key flag
@@ -250,6 +301,33 @@ fn build_bitcode_arguments(chan : &mut mpsc::Sender<Option<Event>>,
     // that doesn't already specify -c, it will fail because you cannot specify
     // -emit-llvm when generating an executable
     gen_bitcode.push_arg("-c");
+
+    if bc_opts.native_preproc {
+        // GCC and clang have internal directives (from system-level include
+        // files) for handling low-level things like alloc/dealloc resource
+        // management, atomic operations, etc.  If the native compiler is GCC,
+        // some of these directives will cause a failure on the clang bitcode
+        // generation path if they are still present.  Since the bitcode is being
+        // generated on a parallel effort and it is not being used for the final
+        // executable, these internal directives can be nullified to get valid
+        // bitcode with a minimal loss of information in that bitcode.
+        //
+        // If --strict is set, these are not applied and must be done manually
+        // via --inject-argument="-D..." if still needed.
+        if !bc_opts.strict {
+            gen_bitcode.push_arg("-D__malloc__(X,Y)=");
+            gen_bitcode.push_arg("-D__atomic_store(X,Y,Z)=");
+            gen_bitcode.push_arg("-D__atomic_fetch_add(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_fetch_sub(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_fetch_and(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_fetch_or(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_compare_exchange(A,B,C,D,E,F)=0");
+            gen_bitcode.push_arg("-D__atomic_exchange(A,B,C,D)=0");
+            gen_bitcode.push_arg("-D__atomic_load(A,B,C)=0");
+        }
+    } else {
+        preprocess.disable();
+    };
 
     // Force debug information (unless directed not to)
     if !bc_opts.suppress_automatic_debug {
@@ -264,12 +342,19 @@ fn build_bitcode_arguments(chan : &mut mpsc::Sender<Option<Event>>,
     }
 
     // Sometimes -Werror might be in the arguments, so make sure this doesn't
-    // cause a failure exit if any other command-line arguments are unused.
+    // cause a failure exit if any other command-line arguments are unused.  Note
+    // that this argument is valid for clang only, not gcc.
+    if CLANG_RE.is_match(orig_compiler_cmd .to_str().unwrap_or_else(|| "cc")) {
+        preprocess.push_arg("-Wno-error=unused-command-line-argument");
+    }
     gen_bitcode.push_arg("-Wno-error=unused-command-line-argument");
 
-    // Add any arguments that the user directed us to
+    // Add any arguments that the user directed us to.  Not sure if these affect
+    // pre-processing or code generation, so add them to both and trust the
+    // previous disabling of warnings will make this OK.
     let mut add_it = bc_opts.inject_arguments.iter();
     while let Some(arg) = add_it.next() {
+        preprocess.push_arg(arg);
         gen_bitcode.push_arg(arg);
     }
 
@@ -297,10 +382,22 @@ fn build_bitcode_arguments(chan : &mut mpsc::Sender<Option<Event>>,
         }
 
         if ! arg.to_str().unwrap().starts_with("-o") {
-            gen_bitcode.push_arg(arg);
+            // If pre-processing, the input files are copied over for the
+            // pre-processing step, but they should not be supplied to the
+            // gen_bitcode operation which will take as input the output of
+            // the pre-processing step.  If the pre-processing step is not
+            // used, go ahead and copy the input files to the gen_bitcode
+            // operation as well.
+            preprocess.push_arg(arg);
+            if !bc_opts.native_preproc || arg.to_str().unwrap().starts_with("-") {
+                gen_bitcode.push_arg(arg);
+            }
             if next_is_value {
                 match it.next() {
-                    Some(val) => { gen_bitcode.push_arg(val); }
+                    Some(val) => {
+                        preprocess.push_arg(val);
+                        gen_bitcode.push_arg(val);
+                    }
                     None => {
                         return Err(anyhow::Error::new(
                             BitcodeError::MissingArgValue(
@@ -360,6 +457,12 @@ fn build_bitcode_arguments(chan : &mut mpsc::Sender<Option<Event>>,
     };
     Ok(res)
 }
+
+
+lazy_static::lazy_static! {
+    static ref CLANG_RE: regex::Regex = regex::Regex::new("clang").unwrap();
+}
+
 
 fn build_bitcode_compile_only(chan : &mut mpsc::Sender<Option<Event>>,
                               bc_opts : &BCOpts,
@@ -1136,7 +1239,8 @@ mod tests {
 
                               ).unwrap(),
                               strict: false,
-                              echo_verbose: true };
+                              native_preproc: false,
+                              echo_verbose: true};
 
         // Simple cmdline specification
         let args = [ "-g", "-O1", "-o", "foo.obj",
@@ -1156,6 +1260,20 @@ mod tests {
                            "ChainedSubProcOperations \
                             { chain: [\
                                 SubProcOperation \
+                                { cmd: \"gcc\", \
+                                  args: [\"-E\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-I\", \"src/include\", \
+                                         \"-DDebug\", \
+                                         \"bar.c\"], \
+                                  inp_file: Unneeded, \
+                                  out_file: Option(\"-o\", Temp(\".c\")), \
+                                  in_dir: None \
+                                }, \
+                                SubProcOperation \
                                 { cmd: \"/path/to/clang\", \
                                   args: [\"-emit-llvm\", \
                                          \"-c\", \
@@ -1175,7 +1293,7 @@ mod tests {
                                 }], \
                               initial_inp_file: None, \
                               final_out_file: Some(\"foo.obj\"), \
-                              disabled: [] \
+                              disabled: [0] \
                             }");
                 assert_eq!(a.resolved_object_target, "foo.obj");
                 let chan_out = receiver.try_recv();
@@ -1185,7 +1303,7 @@ mod tests {
         }
 
         // Simple cmdline specification, strict bitcode
-        let bcopts_strict = BCOpts { strict: true, ..bcopts };
+        let bcopts_strict = BCOpts { strict: true, native_preproc: true, ..bcopts };
         let bcargs1 = build_bitcode_arguments(&mut sender, &bcopts_strict,
                                               &OsString::from("c"), &args);
         match bcargs1 {
@@ -1194,6 +1312,22 @@ mod tests {
                 assert_eq!(format!("{:?}", a.ops),
                            "ChainedSubProcOperations \
                             { chain: [\
+                                SubProcOperation \
+                                { cmd: \"c\", \
+                                  args: [\"-E\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-O1\", \
+                                         \"-march=mips\", \
+                                         \"-I\", \"src/include\", \
+                                         \"-DDebug\", \
+                                         \"bar.c\"], \
+                                  inp_file: Unneeded, \
+                                  out_file: Option(\"-o\", Temp(\".c\")), \
+                                  in_dir: None \
+                                }, \
                                 SubProcOperation \
                                 { cmd: \"/path/to/clang\", \
                                   args: [\"-emit-llvm\", \
@@ -1207,9 +1341,69 @@ mod tests {
                                          \"-O1\", \
                                          \"-march=mips\", \
                                          \"-I\", \"src/include\", \
+                                         \"-DDebug\"], \
+                                  inp_file: Append(TBD), \
+                                  out_file: Option(\"-o\", Temp(\".bc\")), \
+                                  in_dir: None \
+                                }], \
+                              initial_inp_file: None, \
+                              final_out_file: Some(\"foo.obj\"), \
+                              disabled: [] \
+                            }");
+                assert_eq!(a.resolved_object_target, "foo.obj");
+                let chan_out = receiver.try_recv();
+                assert!(chan_out.is_err());
+                assert_eq!(chan_out.err(), Some(mpsc::TryRecvError::Empty));
+            }
+        }
+
+        // Simple cmdline specification, non-strict, native preprocessing
+        let bcopts_preproc = BCOpts { native_preproc: true, ..bcopts };
+        let bcargs2 = build_bitcode_arguments(&mut sender, &bcopts_preproc,
+                                              &OsString::from("c"), &args);
+        match bcargs2 {
+            Err(e) => assert_eq!(e.to_string(), "<no error expected>"),
+            Ok(a) => {
+                assert_eq!(format!("{:?}", a.ops),
+                           "ChainedSubProcOperations \
+                            { chain: [\
+                                SubProcOperation \
+                                { cmd: \"c\", \
+                                  args: [\"-E\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-I\", \"src/include\", \
                                          \"-DDebug\", \
                                          \"bar.c\"], \
                                   inp_file: Unneeded, \
+                                  out_file: Option(\"-o\", Temp(\".c\")), \
+                                  in_dir: None \
+                                }, \
+                                SubProcOperation \
+                                { cmd: \"/path/to/clang\", \
+                                  args: [\"-emit-llvm\", \
+                                         \"-c\", \
+                                         \"-D__malloc__(X,Y)=\", \
+                                         \"-D__atomic_store(X,Y,Z)=\", \
+                                         \"-D__atomic_fetch_add(X,Y,Z)=0\", \
+                                         \"-D__atomic_fetch_sub(X,Y,Z)=0\", \
+                                         \"-D__atomic_fetch_and(X,Y,Z)=0\", \
+                                         \"-D__atomic_fetch_or(X,Y,Z)=0\", \
+                                         \"-D__atomic_compare_exchange(A,B,C,D,E,F)=0\", \
+                                         \"-D__atomic_exchange(A,B,C,D)=0\", \
+                                         \"-D__atomic_load(A,B,C)=0\", \
+                                         \"-g\", \
+                                         \"-O0\", \
+                                         \"-Wno-error=unused-command-line-argument\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-I\", \"src/include\", \
+                                         \"-DDebug\"], \
+                                  inp_file: Append(TBD), \
                                   out_file: Option(\"-o\", Temp(\".bc\")), \
                                   in_dir: None \
                                 }], \
@@ -1225,7 +1419,7 @@ mod tests {
         }
 
         // Alternate cmdline specification
-        let bcargs2 = build_bitcode_arguments(&mut sender, &bcopts,
+        let bcargs3 = build_bitcode_arguments(&mut sender, &bcopts,
                                               &OsString::from("clang"),
                                               &[ "-ofoo.obj",
                                                    "-remove",
@@ -1234,12 +1428,25 @@ mod tests {
                                                    "-DDebug",
                                                    "bar.cc"
                                               ].map(|s| s.into()));
-        match bcargs2 {
+        match bcargs3 {
             Err(e) => assert_eq!(e.to_string(), "<no error expected>"),
             Ok(a) => {
                 assert_eq!(format!("{:?}", a.ops),
                            "ChainedSubProcOperations \
                             { chain: [\
+                                SubProcOperation \
+                                { cmd: \"clang\", \
+                                  args: [\"-E\", \
+                                         \"-Wno-error=unused-command-line-argument\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-DDebug\", \
+                                         \"bar.cc\"], \
+                                  inp_file: Unneeded, \
+                                  out_file: Option(\"-o\", Temp(\".cc\")), \
+                                  in_dir: None \
+                                }, \
                                 SubProcOperation \
                                 { cmd: \"/path/to/clang\", \
                                   args: [\"-emit-llvm\", \
@@ -1258,7 +1465,7 @@ mod tests {
                                 }], \
                               initial_inp_file: None, \
                               final_out_file: Some(\"foo.obj\"), \
-                              disabled: [] \
+                              disabled: [0] \
                             }");
                 assert_eq!(a.resolved_object_target, "foo.obj");
                 let chan_out = receiver.try_recv();

@@ -213,7 +213,8 @@ fn test_zlib() -> anyhow::Result<()> {
     let extract_opts = ExtractOptions { input: so_path,
                                         output: bc_path,
                                         llvm_link_path: user_llvm_link_cmd(),
-                                        objcopy_path: None };
+                                        objcopy_path: None,
+                                        verbose: true };
     extract_bitcode(extract_opts)?;
     assert!(bc_path2.exists());
     Ok(())
@@ -266,7 +267,8 @@ fn test_no_compile_only() -> anyhow::Result<()> {
     let extract_opts = ExtractOptions { input: exe_path,
                                         output: bc_path,
                                         llvm_link_path: user_llvm_link_cmd(),
-                                        objcopy_path: None };
+                                        objcopy_path: None,
+                                        verbose: true };
     extract_bitcode(extract_opts)?;
     eprintln!("## bitcode extracted");
     assert!(bc_path2.exists());
@@ -324,7 +326,8 @@ fn test_blddir() -> anyhow::Result<()> {
     let extract_opts = ExtractOptions { input: exe_path,
                                         output: bc_path,
                                         llvm_link_path: user_llvm_link_cmd(),
-                                        objcopy_path: None };
+                                        objcopy_path: None,
+                                        verbose: true };
     extract_bitcode(extract_opts)?;
     eprintln!("## bitcode extracted");
     assert!(bc_path2.exists());

@@ -124,6 +124,8 @@ struct BCOpts<'a> {
     /// If true, use the native compiler to pre-process the code before
     /// generating the bitcode with clang.
     native_preproc : bool,
+    /// If true, echo executed commands to stdout
+    echo_verbose : bool,
 }
 
 pub fn bitcode_entrypoint(bitcode_options : &BitcodeOptions) -> anyhow::Result<i32> {
@@ -175,6 +177,7 @@ pub fn bitcode_entrypoint(bitcode_options : &BitcodeOptions) -> anyhow::Result<i
                            remove_arguments : &remove_rx,
                            strict : bitcode_options.strict,
                            native_preproc : bitcode_options.preproc_native,
+                           echo_verbose : bitcode_options.verbose,
     };
     let ptracer1 = generate_bitcode(&mut sender, ptracer, &bc_opts)?;
 
@@ -488,7 +491,8 @@ fn build_bitcode_compile_only(chan : &mut mpsc::Sender<Option<Event>>,
                 let _res = chan.send(Some(Event::BitcodeGenerationAttempts));
                 let bctarget = bc_args.resolved_object_target.clone();
                 attach_bitcode(cwd, &bc_opts, &mut bc_args, &bctarget)?;
-                let ops_result = bc_args.ops.execute(&Some(cwd));
+                let ops_result = bc_args.ops.execute(&Some(cwd),
+                                                     bc_opts.echo_verbose);
                 match ops_result {
                     Err(e) => {
                         let _ = // Ignore chan.send errors
@@ -1238,7 +1242,8 @@ mod tests {
 
                               ).unwrap(),
                               strict: false,
-                              native_preproc: false };
+                              native_preproc: false,
+                              echo_verbose: true};
 
         // Simple cmdline specification
         let args = [ "-g", "-O1", "-o", "foo.obj",

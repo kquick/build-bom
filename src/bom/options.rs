@@ -30,6 +30,8 @@ pub struct ExtractOptions {
     pub llvm_link_path : Option<PathBuf>,
     #[structopt(long="objcopy", help="Name of the objcopy binary to use to when generating bitcode (default: `objcopy`)")]
     pub objcopy_path : Option<PathBuf>,
+    #[structopt(short="v", long="verbose", help="Generate verbose output")]
+    pub verbose : bool,
 }
 
 #[derive(Debug,StructOpt)]

@@ -8,21 +8,21 @@
 //
 // Event:
 //
-// * syscall_enter -- if this is an execve syscall, the execve target
-//                    may be a clang invocation on a source code file.
-//                    At syscall entry, the cmdline arguments are
-//                    captured for that determination later.
+// * SyscallEnter -- if this is an execve syscall, the execve target
+//                   may be a clang invocation on a source code file.
+//                   At syscall entry, the cmdline arguments are
+//                   captured for that determination later.
 //
-// * syscall_exit -- if this is the exit from an execve syscall and it
-//                   failed, the preserved arguments from above can be
-//                   discarded.  Note that even if this is an execve,
-//                   the syscall has returned to the *original*
-//                   executable (albeit to libc library code therein),
-//                   so this does *not* represent successfull
-//                   completion of the exec'd target (which may or may
-//                   not be clang).  Thus, a successful syscall_exit
-//                   leaves the cmdline argument information available
-//                   and is otherwise ignored.
+// * SyscallExit -- if this is the exit from an execve syscall and it
+//                  failed, the preserved arguments from above can be
+//                  discarded.  Note that even if this is an execve,
+//                  the syscall has returned to the *original*
+//                  executable (albeit to libc library code therein),
+//                  so this does *not* represent successfull
+//                  completion of the exec'd target (which may or may
+//                  not be clang).  Thus, a successful syscall_exit
+//                  leaves the cmdline argument information available
+//                  and is otherwise ignored.
 //
 // * Exec -- this is the trace that records the actual change of
 //           executable code to the new target.  This is actually
@@ -78,21 +78,24 @@
 use regex::RegexSet;
 use std::collections::HashMap;
 use std::path::{Path,PathBuf};
-use std::io::Read;
+use std::io::{Read, Write};
+use std::fs::File;
 use std::process;
 use std::ffi::{OsString};
 use std::os::unix::ffi::OsStringExt;
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 use sha2::{Digest,Sha256};
 use thiserror::Error;
 
-use crate::bom::options::{BitcodeOptions};
+use crate::bom::options::{BitcodeOptions, path_def};
 use crate::bom::syscalls::load_syscalls;
 use crate::bom::event::RawString;
 use crate::bom::proc_read::{read_str_from,read_str_list_from,read_environment,read_cwd};
 use crate::bom::clang_support;
+use crate::bom::chainsop::{Executable, ChainedSubOps, NamedFile, FileRef, c_compile, clang_bitcode, SubProcOperation, SubProcError, DesignatedFile, ExeFileSpec, FunctionOperation, OpInterface, FilesPrep};
 
 #[derive(Error, Debug)]
 pub enum TracerError {
@@ -104,18 +107,27 @@ pub enum TracerError {
     NoCommandGiven
 }
 
+
 /// Options controlling bitcode generation that we need to plumb through most of the process
 struct BCOpts<'a> {
     /// The clang command to use to generate bitcode
-    clang_path : OsString,
-    /// The directory to store generated bitcode in
-    bitcode_directory : Option<&'a PathBuf>,
+    clang_executable : &'a Executable,
+    /// The command to add a Section to an ELF file
+    add_elf_section_executable : &'a Executable,
     /// If true, do *not* force the generation of debug information
     suppress_automatic_debug : bool,
     /// Arguments to inject when building bitcode
     inject_arguments : &'a Vec<String>,
     /// Arguments to remove when building bitcode
-    remove_arguments : RegexSet
+    remove_arguments : &'a RegexSet,
+    /// Strict: maintain strict adherence between the bitcode and the target code
+    /// (optimization, target architecture, etc.)
+    strict : bool,
+    /// If true, use the native compiler to pre-process the code before
+    /// generating the bitcode with clang.
+    native_preproc : bool,
+    /// If true, echo executed commands to stdout
+    echo_verbose : bool,
 }
 
 pub fn bitcode_entrypoint(bitcode_options : &BitcodeOptions) -> anyhow::Result<i32> {
@@ -126,16 +138,32 @@ pub fn bitcode_entrypoint(bitcode_options : &BitcodeOptions) -> anyhow::Result<i
     let (cmd0, args0) = bitcode_options.command.split_at(1);
     let cmd_path = which::which(OsString::from(&cmd0[0]))?;
 
-    let mut cmd = Command::new(cmd_path);
+    let mut cmd = Command::new(cmd_path.clone());
     cmd.args(args0);
     let mut ptracer = pete::Ptracer::new();
 
     // Spawn the subprocess for the command and start it (it starts off
     // suspended to allow the ptracing process to attach)
-    let _child = ptracer.spawn(cmd);
+    let child = ptracer.spawn(cmd);
+    match child {
+        Ok(_) => {}
+        Err(e) => {
+            println!("ERROR spawning tracee (command: {}, explicitly: {:?}): {}",
+                     bitcode_options.command.join(" "),
+                     cmd_path,
+                     e);
+            return Err(anyhow::Error::new(TracerError::NoTraceeOnExit));
+            // // This just needs to be a non-zero value; 77 is arbitrarily chosen
+            // // as possibly recognizeable for tests.
+            // return Error(77);
+        }
+    }
     match ptracer.wait()? {
         None => {
             println!("Error spawning tracee (command: {})", bitcode_options.command.join(" "));
+            // This just needs to be a non-zero value; 78 is arbitrarily chosen
+            // as possibly recognizeable for tests.
+            return Err(anyhow::Error::new(TracerError::NoTraceeOnExit));
         }
         Some(tracee) => {
             ptracer.restart(tracee, pete::Restart::Syscall)?;
@@ -158,148 +186,333 @@ pub fn bitcode_entrypoint(bitcode_options : &BitcodeOptions) -> anyhow::Result<i
     let rx_strs = bitcode_options.remove_arguments.iter().map(|rx| rx.as_str());
     let remove_rx = RegexSet::new(rx_strs)?;
 
-    let bc_opts = BCOpts { clang_path : bitcode_options.clang_path.as_ref().map(|s| OsString::from(s.as_path().as_os_str()))
-                                                        .unwrap_or(OsString::from("clang")),
-                           bitcode_directory : bitcode_options.bcout_path.as_ref(),
+    // let user_clang = bitcode_options.clang_path.as_ref()
+    //     .map(|pb| clang_bitcode().set_exe(pb));
+
+    let user_clang = match bitcode_options.clang_path {
+        None => clang_bitcode(),
+        Some(ref p) => clang_bitcode().set_exe(p)
+    };
+
+    let add_elf_section =
+        Executable::new("objcopy",
+                        ExeFileSpec::ViaCall(Rc::new(|args, file| {
+                            args.push("--add-section".into());
+                            let section_arg =
+                                |fname:&Path| format!(
+                                    "{}={}",
+                                    ELF_SECTION_NAME,
+                                    fname.to_str() .unwrap_or("{invalid-fname}")
+                                )
+                                .into();
+                            match file {
+                                DesignatedFile::NoDesignatedFile => {
+                                    Err(anyhow::Error::new(
+                                        SubProcError::ErrorMissingFile(
+                                            "objcopy".into(), "output".into())))
+                                },
+                                DesignatedFile::SingleFile(_) => {
+                                    args.push(section_arg(
+                                        file.to_path("objcopy",
+                                                     "section-output-file")
+                                            .unwrap_or("{invalid-section-file}".into())
+                                            .as_path()));
+                                    Ok(())
+                                },
+                                DesignatedFile::MultiFile(_) => {
+                                    Err(anyhow::Error::new(
+                                        SubProcError::ErrorUnsupportedDesignatedFile(
+                                            "objcopy".into())))
+                                },
+                            }
+                        }
+                        )),
+                        ExeFileSpec::Append);
+
+    let user_objcopy = match bitcode_options.objcopy_path { // KWQ: use options.rs path_def after adjustment
+        None => add_elf_section,
+        Some(ref p) => add_elf_section.set_exe(p)
+    };
+
+    let bc_opts = BCOpts {
+        clang_executable : &user_clang,
+                           add_elf_section_executable : &user_objcopy,
                            suppress_automatic_debug : bitcode_options.suppress_automatic_debug,
                            inject_arguments : &bitcode_options.inject_arguments,
-                           remove_arguments : remove_rx
+                           remove_arguments : &remove_rx,
+                           strict : bitcode_options.strict,
+                           native_preproc : bitcode_options.preproc_native,
+                           echo_verbose : bitcode_options.verbose,
     };
     let ptracer1 = generate_bitcode(&mut sender, ptracer, &bc_opts)?;
 
     // Send a token to shut down the event collector thread
     sender.send(None)?;
     let summary = event_consumer.join().unwrap();
+    let exitmod =
+        if bitcode_options.any_fail && summary.has_failures() {
+            // If the mainline succeeded (ec == 0), return an error indicating
+            // that the bitcode-generation attempt failed.  This just needs to be
+            // a non-zero value; 76 is arbitrarily chosen as possibly
+            // recognizeable for tests.
+            |ec| if ec == 0 { 76 } else { ec }
+        } else {
+            |ec| ec
+        };
     print_summary(summary);
 
     let (mut last_ptracer, exitcode) = ptracer1;
     let tracee = last_ptracer.wait()?;
     match tracee {
-        None => { Ok(exitcode) }
+        None => Ok(exitcode),
         Some(t) =>
             match t.stop {
                 pete::Stop::Exiting { exit_code: ec } => { Ok(ec) }
                 _ => { Err(anyhow::anyhow!(TracerError::UnexpectedExitState(t.stop))) }
             }
     }
+    .map(exitmod)
 }
 
 #[derive(Debug)]
 pub enum Event {
     PipeInputOrOutput(RunCommand),
     ResponseFile(RunCommand),
-    MultipleInputsWithImplicitOutput(OsString,Vec<OsString>),
+    MultipleInputsWithImplicitOutput(PathBuf,Vec<OsString>),
     BuildFailureSkippedBitcode(RunCommand, i32),
     BuildFailureUnknownEffect(RunCommand, i32),
     SkippingAssembleOnlyCommand(RunCommand),
-    BitcodeCompileError(PathBuf, Vec<OsString>,Vec<u8>,Vec<u8>,Option<i32>),
-    BitcodeAttachError(PathBuf, Vec<OsString>,Vec<u8>,Vec<u8>,Option<i32>),
+    BitcodeGenerationError(PathBuf, anyhow::Error),
     BitcodeGenerationAttempts,
     BitcodeCaptured(PathBuf)
 }
 
 struct BitcodeArguments {
-    bitcode_arguments : Vec<OsString>,
-    resolved_bitcode_target : OsString,
+    ops : ChainedSubOps,
     resolved_object_target : OsString
 }
 
-fn make_bitcode_filename(target : &OsString, bc_dir : Option<&PathBuf>) -> PathBuf {
-    let mut target_path = match bc_dir {
-        None => PathBuf::from(&target),
-        Some(p) => {
-            let mut pp = PathBuf::from(&p);
-            pp.push(&PathBuf::from(&target).file_name().expect("target is not a file"));
-            pp
-        }
-    };
-    target_path.set_extension("bc");
-    target_path
-}
-
 /// Given original arguments (excluding argv[0]), construct the command line we
-/// will pass to clang to build bitcode
+/// will pass to clang to build bitcode.  This will occur in one of two ways:
+///
+///  1) call clang with all arguments from the original compile command except
+///     those that are blacklisted (and whitelisted unless --strict) and with
+///     additional flags to emit LLVM bitcode instead of object code.
+///
+///  2) if native_preproc is true, call the original compiler with most original
+///     compile arguments (except those that are blacklisted and, if not
+///     --strict, whitelisted) and pass -E to run the pre-processor only.  Then
+///     run the clang bitcode generation (with only those arguments relating to
+///     code generation) on that pre-processor output.
 ///
 /// This handles removing flags that clang can't handle (or that we definitely
 /// do not want for bitcode generation), as well as transforming the output file
 /// path
 fn build_bitcode_arguments(chan : &mut mpsc::Sender<Option<Event>>,
                            bc_opts : &BCOpts,
+                           orig_compiler_cmd: &OsString,
                            orig_args : &[OsString]) -> anyhow::Result<BitcodeArguments> {
     let mut orig_target = None;
-    let mut new_target = OsString::from("");
-    let mut modified_args = Vec::new();
+    let ops = ChainedSubOps::new();
 
-    // We always need to add this key flag
-    modified_args.push(OsString::from("-emit-llvm"));
-    // Always add the -c flag; if we don't, bitcode built from a compile command
-    // that doesn't already specify -c, it will fail because you cannot specify
-    // -emit-llvm when generating an executable
-    modified_args.push(OsString::from("-c"));
+    // Determine the language of the original input file, so that the bitcode can
+    // utilize the same language, because using C++ mode to compile C will cause
+    // errors:
+    //
+    // char* greeting() { return "hello, world"; }
+    //
+    // The above is perfectly acceptable C, but if compile as C++ it yields:
+    // error: ISO C++11 does not allow conversion from string literal to 'char*'.
+    let is_c_plusplus = orig_args.iter().find(
+        |&arg| arg.to_str().map(|a| !a.starts_with("-") &&
+                                (a.ends_with(".cc") ||
+                                 a.ends_with(".cpp")))
+            .unwrap_or_else(|| false))
+        .is_some();
+    let file_ext = if is_c_plusplus { ".cc" } else { ".c" };
+
+    // If the native compiler is used for preprocessing, it will write to a
+    // temporary output file that is subsequently consumed by clang to generate
+    // the bitcode.
+    let preprocessed_output = NamedFile::temp(file_ext);
+
+    let preprocess = ops.push_op(SubProcOperation::for_(&c_compile())
+                                 .set_executable(orig_compiler_cmd)
+                                 .push_arg("-E")
+                                 .set_output_file(&preprocessed_output)
+                                 // .output(&preprocessed_output)
+    );
+
+    let gen_bitcode = ops.push_op(
+        SubProcOperation::for_(bc_opts.clang_executable)
+            .set_output_file(&NamedFile::temp(".bc")));
+    // KWQ: pre-register SubProcOperations
+    // KWQ: if overrides (or not), e.g. objcopy, should check to see if those exist before running and fail (hard?) if they don't (e.g. "objcopy" v.s. "arm-none-eabi-objcopy").
+    // KWQ: last bitcode capture shows object file, but really wanted executable.  That executable link stage doesn't invoke a bitcode capture, but could this be tracked as an operation performed on that final bitcode generation file?
+
+    // KWQ: chaining will decide whether to supply an input file from the pre-processing or not.  If not, the input file is extracted from the arguments to the original compile command and thus not explicitly stated.
+    // KWQ: would be a better analysis to collect the input files during overall argument analysis, and then explicitly provide them here?  Or instead it is provided to the overall chain...
+    // if bc_opts.native_preproc {
+    //     // KWQ: this is NOT preprocessed_output... that is the input NamedFile.  Want the DesignatedFile instead... and this should be auto-set by the chaining.
+    //     gen_bitcode.set_input(&FileSpec::Append(NamedFile::TBD), &preprocessed_output)
+    // } else {
+    //     // Input file specification is not necessary: these will be
+    //     // collected from the orig_args as they are processed.
+
+    //     // KWQ: need a NamedFile::Unneeded that allows the Executable::Append to be ignored here:
+    //     gen_bitcode.set_input(&FileSpec::Unneeded, &NamedFile::TBD)  // KWQ under the above, this is now NoFileUsed?  Or is it than an Append without a .set_input() does nothing (or should that generate a warning, or does it inherit in the chain????)
+    // };
+
+
+    if bc_opts.native_preproc {
+        // GCC and clang have internal directives (from system-level include
+        // files) for handling low-level things like alloc/dealloc resource
+        // management, atomic operations, etc.  If the native compiler is GCC,
+        // some of these directives will cause a failure on the clang bitcode
+        // generation path if they are still present.  Since the bitcode is being
+        // generated on a parallel effort and it is not being used for the final
+        // executable, these internal directives can be nullified to get valid
+        // bitcode with a minimal loss of information in that bitcode.
+        //
+        // If --strict is set, these are not applied and must be done manually
+        // via --inject-argument="-D..." if still needed.
+        if !bc_opts.strict {
+            gen_bitcode.push_arg("-D__malloc__(X,Y)=");
+            gen_bitcode.push_arg("-D__atomic_store(X,Y,Z)=");
+            gen_bitcode.push_arg("-D__atomic_fetch_add(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_fetch_sub(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_fetch_and(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_fetch_or(X,Y,Z)=0");
+            gen_bitcode.push_arg("-D__atomic_compare_exchange(A,B,C,D,E,F)=0");
+            gen_bitcode.push_arg("-D__atomic_exchange(A,B,C,D)=0");
+            gen_bitcode.push_arg("-D__atomic_load(A,B,C)=0");
+        }
+    } else {
+        preprocess.disable();
+    };
 
     // Force debug information (unless directed not to)
     if !bc_opts.suppress_automatic_debug {
-        modified_args.push(OsString::from("-g"));
+        gen_bitcode.push_arg("-g");
     }
 
-    // Add any arguments that the user directed us to
+    // If not in strict mode, explicitly disable optimization (favoring a maximal
+    // amount of information in the generated bitcode and avoiding things like
+    // inlining, dead code elimination, etc.
+    if !bc_opts.strict {
+        gen_bitcode.push_arg("-O0");
+    }
+
+    // Sometimes -Werror might be in the arguments, so make sure this doesn't
+    // cause a failure exit if any other command-line arguments are unused.  Note
+    // that this argument is valid for clang only, not gcc.
+    if CLANG_RE.is_match(orig_compiler_cmd .to_str().unwrap_or_else(|| "cc")) {
+        preprocess.push_arg("-Wno-error=unused-command-line-argument");
+    }
+    gen_bitcode.push_arg("-Wno-error=unused-command-line-argument"); // KWQ: rmv?
+
+    // KWQ add these (solo commit)
+    // gen_bitcode.push_arg("-frecord-command-line");
+    // gen_bitcode.push_arg("-fno-discard-value-names");
+
+    // C99 and later do not support implicit function declarations, but be more
+    // permissive (as GCC seems to be).
+    gen_bitcode.push_arg("-Wno-error=implicit-function-declaration");
+
+    // Add any arguments that the user directed us to.  Not sure if these affect
+    // pre-processing or code generation, so add them to both and trust the
+    // previous disabling of warnings will make this OK.
     let mut add_it = bc_opts.inject_arguments.iter();
     while let Some(arg) = add_it.next() {
-        modified_args.push(OsString::from(arg));
+        preprocess.push_arg(arg);
+        gen_bitcode.push_arg(arg);
     }
 
-    // Next, copy over all of the flags we want to keep
+    // Next, copy over all of the flags we want to keep.
     let mut it = orig_args.iter();
-    let mut skip_next = false;
     while let Some(arg) = it.next() {
-        // Skip value argument to a previous blacklisted argument
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
+        let next_is_value = clang_support::next_arg_is_option_value(arg);
 
         // Skip any arguments explicitly blacklisted
-        if clang_support::is_blacklisted_clang_argument(arg) {
-            skip_next = clang_support::is_unary_option(arg);
+        if clang_support::is_blacklisted_clang_argument(bc_opts.strict, arg) {
+            if next_is_value {
+                it.next();  // skip next argument
+            }
             continue;
         }
 
         if arg.to_str().map_or(false, |s| bc_opts.remove_arguments.is_match(s)) {
-            // Reject arguments matching any of the user-provided regexes.  Note
-            // that this is of course as unsafe as users make it.  In
-            // particular, rejecting '-o' would be very bad.
-            skip_next = clang_support::is_unary_option(arg);  // hopeful here...
+            // Reject argument because it matches one of the user-provided
+            // regexes.  Note that this is of course as unsafe as users make it.
+            // In particular, rejecting '-o' would be very bad.
+            if next_is_value {
+                it.next();
+            }
             continue;
-        } else {
-            modified_args.push(OsString::from(arg.to_owned()));
         }
 
-        // If the argument specifies the output file, we need to munge the name
-        // of the output file (which is the next argument) to have an
-        // appropriate extension and to put it in the requested bitcode
-        // directory (if any)
-        if arg == "-o" {
-            match it.next() {
-                None => {
-                    return Err(anyhow::Error::new(BitcodeError::MissingOutputFile(Path::new(&bc_opts.clang_path).to_path_buf(), Vec::from(orig_args))));
+        if ! arg.to_str().unwrap().starts_with("-o") {
+            if arg.to_str().unwrap().starts_with("-") {
+                preprocess.push_arg(arg);
+                gen_bitcode.push_arg(arg);
+            } else {
+                // Doesn't start with an option dash, and option values and
+                // output files are handled elsewhere, so this is assumed to be
+                // an input file.
+                ops.set_inp_file_for_chain(&Some(arg.into()));
+            }
+            // } else {
+
+
+            // // If pre-processing, the input files are copied over for the
+            // // pre-processing step, but they should not be supplied to the
+            // // gen_bitcode operation which will take as input the output of
+            // // the pre-processing step.  If the pre-processing step is not
+            // // used, go ahead and copy the input files to the gen_bitcode
+            // // operation as well.
+            // preprocess.push_arg(arg);
+            // if !bc_opts.native_preproc || arg.to_str().unwrap().starts_with("-") {
+            //     gen_bitcode.push_arg(arg);
+            // }
+            if next_is_value {
+                match it.next() {
+                    Some(val) => {
+                        preprocess.push_arg(val);
+                        gen_bitcode.push_arg(val);
+                    }
+                    None => {
+                        return Err(anyhow::Error::new(
+                            BitcodeError::MissingArgValue(
+                                orig_compiler_cmd.into(),
+                                orig_args.to_vec(),
+                                arg.clone())));
+                    }
                 }
-                Some(target) => {
-                    orig_target = Some(PathBuf::from(&target).into_os_string());
-                    let target_path = make_bitcode_filename(target, bc_opts.bitcode_directory);
-                    new_target = OsString::from(target_path.clone());
-                    modified_args.push(target_path.into_os_string());
+            }
+        } else {
+            // The argument specifies the output file, so note that file here.
+            // If no argument explicitly specifies an output file then it will
+            // need to be inferred (later below) from the input files.
+            if arg == "-o" {
+                match it.next() {
+                    None => {
+                        return Err(anyhow::Error::new(BitcodeError::MissingOutputFile(bc_opts.clang_executable.exe_file.clone(), Vec::from(orig_args))));
+                    }
+                    Some(target) => { orig_target = Some(target.clone()); }
                 }
+            } else {
+                let (_,tgt) = arg.to_str().unwrap().split_at(2);
+                orig_target = Some(OsString::from(tgt));
             }
         }
     }
 
     let resolved_object_target;
-    let resolved_bitcode_target;
     match orig_target {
         Some(t) => {
             // We found a target explicitly specified with -o
-            resolved_object_target = t;
-            resolved_bitcode_target = new_target;
+            resolved_object_target = t.clone();
+            ops.set_out_file_for_chain(&Some(PathBuf::from(t)));
         }
         None => {
             // There was no explicitly-specified object file.  If there was a
@@ -310,12 +523,10 @@ fn build_bitcode_arguments(chan : &mut mpsc::Sender<Option<Event>>,
                     let mut target_path = PathBuf::from(source_file);
                     target_path.set_extension("o");
                     resolved_object_target = OsString::from(target_path.clone());
-                    let mut bc_path = target_path;
-                    bc_path.set_extension("bc");
-                    resolved_bitcode_target = OsString::from(bc_path.clone());
+                    ops.set_out_file_for_chain(&Some(PathBuf::from(target_path)));
                 }
                 Err(msg) => {
-                    let _res = chan.send(Some(Event::MultipleInputsWithImplicitOutput(bc_opts.clang_path.to_os_string(), orig_args.to_vec())));
+                    let _res = chan.send(Some(Event::MultipleInputsWithImplicitOutput(bc_opts.clang_executable.exe_file.clone(), orig_args.to_vec())));
                     return Err(anyhow::Error::new(msg));
                 }
             }
@@ -323,41 +534,57 @@ fn build_bitcode_arguments(chan : &mut mpsc::Sender<Option<Event>>,
     }
 
     let res = BitcodeArguments {
-        bitcode_arguments : modified_args,
-        resolved_bitcode_target : resolved_bitcode_target,
-        resolved_object_target : resolved_object_target
+        ops,
+        resolved_object_target,
     };
     Ok(res)
 }
 
+
+lazy_static::lazy_static! {
+    static ref CLANG_RE: regex::Regex = regex::Regex::new("clang").unwrap();
+}
+
+
 fn build_bitcode_compile_only(chan : &mut mpsc::Sender<Option<Event>>,
                               bc_opts : &BCOpts,
                               args : &[OsString],
+                              orig_compiler_cmd : &OsString,
                               cwd : &Path
 ) -> anyhow::Result<()> {
-    let bc_args = build_bitcode_arguments(chan, bc_opts, args)?;
+    let mut bc_args = build_bitcode_arguments(chan, bc_opts, orig_compiler_cmd, args)?;
 
-    if !obj_already_has_bitcode(cwd, &bc_args.resolved_object_target) {
-        let _res = chan.send(Some(Event::BitcodeGenerationAttempts));
+    match bc_args.ops.out_file_for_chain() {
 
-        let child = process::Command::new(&bc_opts.clang_path).
-            args(&bc_args.bitcode_arguments).
-            current_dir(cwd).
-            stdout(process::Stdio::piped()).
-            stderr(process::Stdio::piped()).
-            spawn()?;
-        let out = child.wait_with_output()?;
-        if out.status.success() {
-            attach_bitcode(chan, cwd, &bc_args.resolved_object_target, &bc_args.resolved_bitcode_target)?;
-        } else {
-            let err = Event::BitcodeCompileError(Path::new(&bc_opts.clang_path).to_path_buf(),
-                                                 Vec::from(bc_args.bitcode_arguments.clone()),
-                                                 out.stdout,
-                                                 out.stderr,
-                                                 out.status.code());
-            let _res = chan.send(Some(err))?;
-            return Err(anyhow::Error::new(BitcodeError::ErrorGeneratingBitcode(Path::new(&bc_opts.clang_path).to_path_buf(),
-                                                                               Vec::from(bc_args.bitcode_arguments))));
+        // Not typical: this means that the argument analysis performed above
+        // could not identify an explicit output file or an implicit output
+        // file determined by identifying an input file.
+        None =>
+            return Err(anyhow::Error::new(
+                BitcodeError::MissingOutputFile(orig_compiler_cmd.into(),
+                                                args.to_vec()))),
+
+        Some(f) => {
+            let fstr = f.clone().into_os_string();
+            if !obj_already_has_bitcode(cwd, &fstr) {
+                let _res = chan.send(Some(Event::BitcodeGenerationAttempts));
+                let bctarget = bc_args.resolved_object_target.clone();
+                attach_bitcode(cwd, &bc_opts, &mut bc_args, &bctarget)?;
+                let ops_result = bc_args.ops.execute(&Some(cwd),
+                                                     bc_opts.echo_verbose);
+                match ops_result {
+                    Err(e) => {
+                        let _ = // Ignore chan.send errors
+                            chan.send(Some(Event::BitcodeGenerationError(f, e)));
+                        // Errors are discarded here (bitcode generation behind
+                        // the scenes).  If errors in the bitcode generation
+                        // should fail the build-bom run, this is handled at the
+                        // end where the chan.send statistics are evaluated.
+                    }
+                    Ok(_) =>
+                        chan.send(Some(Event::BitcodeCaptured(PathBuf::from(&bctarget))))?
+                }
+            }
         }
     }
 
@@ -398,11 +625,12 @@ fn input_sources<'a>(args : &'a[OsString]) -> Result<&'a OsString,BitcodeError> 
     let mut inputs = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
-        if clang_support::is_unary_option(arg) {
-            // Discard the next argument since it can't be a source file
-            let _next_arg = it.next();
-        } else if clang_support::is_nullary_option(arg) {
-            // Just ignore it
+        if clang_support::is_option_arg(arg) {
+            if clang_support::next_arg_is_option_value(arg) {
+                // Discard the next argument since it can't be a source file
+                let _next_arg = it.next();
+            }
+            // ignore it whether there's a following argument or not
         } else {
             // This is an argument
             inputs.push(arg);
@@ -412,10 +640,14 @@ fn input_sources<'a>(args : &'a[OsString]) -> Result<&'a OsString,BitcodeError> 
     if inputs.len() == 1 {
         Ok(inputs[0])
     } else {
-        Err(BitcodeError::MultipleInputFiles(
-            inputs.iter().map(|s| s.to_string_lossy().into_owned()).collect(),
-            Vec::from(args))
-        )
+        if inputs.len() == 0 {
+            Err(BitcodeError::NoInputFileFound(Vec::from(args)))
+        } else {
+            Err(BitcodeError::MultipleInputFiles(
+                inputs.iter().map(|s| s.to_string_lossy().into_owned()).collect(),
+                Vec::from(args))
+            )
+        }
     }
 }
 
@@ -425,10 +657,16 @@ pub enum BitcodeError {
     ErrorAttachingBitcode(PathBuf, OsString, OsString, std::io::Error, String),
     #[error("Missing output file in command {0:?} {1:?}")]
     MissingOutputFile(PathBuf, Vec<OsString>),
-    #[error("Error generating bitcode with command {0:?} {1:?})")]
+    #[error("Expected argument {2:?} value not present in {0:?} {1:?}")]
+    MissingArgValue(PathBuf, Vec<OsString>, OsString),
+    #[error("Error generating bitcode with command {0:?} {1:?}")]
     ErrorGeneratingBitcode(PathBuf, Vec<OsString>),
+    #[error("Error {2:?} generating bitcode with command {0:?} {1:?}")]
+    ErrorCodeGeneratingBitcode(PathBuf, Vec<OsString>, std::io::Error),
     #[error("Unreadable memory address {0:}")]
     UnreadableMemoryAddress(u64),
+    #[error("No input file found in compilation from args {0:?}")]
+    NoInputFileFound(Vec<OsString>),
     #[error("Multiple input files found for command: files {0:?} from args {1:?}")]
     MultipleInputFiles(Vec<String>, Vec<OsString>)
 }
@@ -510,38 +748,12 @@ fn obj_already_has_bitcode(cwd : &Path, obj_target : &OsString) -> bool {
 
 /// Given the name (path) of a tar file on disk, use objcopy to inject it into
 /// the distinguished ELF section for holding the bitcode (see `ELF_SECTION_NAME`)
-fn inject_bitcode(chan : &mut mpsc::Sender<Option<Event>>,
-                  cwd : &Path,
-                  orig_target : &OsString,
-                  bc_target : &OsString,
-                  tar_name : &String,
-                  object_path : &OsString) -> anyhow::Result<()> {
-    let mut objcopy_args = Vec::new();
-    objcopy_args.push(OsString::from("--add-section"));
-    objcopy_args.push(OsString::from(format!("{}={}", ELF_SECTION_NAME, tar_name)));
-    objcopy_args.push(object_path.into());
-
-    match process::Command::new("objcopy").args(&objcopy_args).stdout(process::Stdio::piped()).stderr(process::Stdio::piped()).current_dir(cwd).spawn() {
-        Err(msg) => {
-            let objcopy_ver = get_objcopy_version_info();
-            return Err(anyhow::Error::new(BitcodeError::ErrorAttachingBitcode(cwd.to_path_buf(), orig_target.clone(), bc_target.clone(), msg, objcopy_ver)));
-        }
-        Ok(child) => {
-            let out = child.wait_with_output()?;
-            if !out.status.success() {
-                let err = Event::BitcodeAttachError(Path::new("objcopy").to_path_buf(),
-                                                    Vec::from(objcopy_args),
-                                                    out.stdout,
-                                                    out.stderr,
-                                                    out.status.code());
-                let _res = chan.send(Some(err))?;
-            } else {
-                    let _res = chan.send(Some(Event::BitcodeCaptured(Path::new(bc_target).to_path_buf())));
-            }
-
-            Ok(())
-        }
-    }
+fn inject_bitcode(bc_opts : &BCOpts,
+                  bc_args : &mut BitcodeArguments) -> anyhow::Result<()> {
+    bc_args.ops.push_op(
+        &SubProcOperation::for_(&bc_opts.add_elf_section_executable)
+            .set_output_file(&NamedFile::temp(".o")));
+    Ok(())
 }
 
 /// Create a singleton tar file with the bitcode file.
@@ -553,10 +765,10 @@ fn inject_bitcode(chan : &mut mpsc::Sender<Option<Event>>,
 /// directories with source files that have similar names.
 ///
 /// To avoid collisions, we append a hash to each filename
-fn build_bitcode_tar(bc_target : &OsString,
-                     bc_path : &Path,
-                     hash : &[u8],
-                     tar_file : &mut tempfile::NamedTempFile) -> anyhow::Result<()> {
+fn build_bitcode_tar<T: Write>(bc_target : &OsString,  // KWQ: args more natural to caller?
+                               bc_path : &Path,
+                               hash : &OsString,
+                               tar_file : T) -> anyhow::Result<()> {
     let mut tb = tar::Builder::new(tar_file);
     let bc_target_path = Path::new(bc_target);
 
@@ -564,7 +776,7 @@ fn build_bitcode_tar(bc_target : &OsString,
     let mut archived_name = OsString::new();
     archived_name.push(bc_target_path.file_stem().unwrap());
     archived_name.push("-");
-    archived_name.push(hex::encode(hash));
+    archived_name.push(hash);
     archived_name.push(".");
     archived_name.push(bc_target_path.extension().unwrap());
 
@@ -579,59 +791,50 @@ fn build_bitcode_tar(bc_target : &OsString,
 /// We pass in the working directory in which the objects were constructed so
 /// that we can generate appropriate commands (in terms of absolute paths) so
 /// that we don't need to worry about where we are replaying the build from.
-fn attach_bitcode(chan : &mut mpsc::Sender<Option<Event>>,
-                  cwd : &Path,
-                  orig_target : &OsString,
+fn attach_bitcode(cwd : &Path,
+                  bc_opts : &BCOpts,
+                  bc_args : &mut BitcodeArguments,
                   bc_target : &OsString) -> anyhow::Result<()> {
-    let object_path = to_absolute(cwd, orig_target);
-    let bc_path = to_absolute(cwd, bc_target);
+    let mut reprname = bc_args.ops.out_file_for_chain().unwrap_or(PathBuf::from("unk.bc"));
+    reprname.set_extension("bc");
 
-    let mut hasher = Sha256::new();
-    let mut bc_content = Vec::new();
-    let mut bc_file = std::fs::File::open(&bc_path)?;
-    bc_file.read_to_end(&mut bc_content)?;
-    hasher.update(bc_content);
-    let hash = hasher.finalize();
+    // To avoid name collisions on extract_bitcode unpack, each filename in the
+    // tarfile should be unique.  Generate a hash of the contents to help provide
+    // uniqueness to the name.
+    let hash_str = {
+        let mut hasher = Sha256::new();
+        let mut bc_content = Vec::new();
+        let bc_path = to_absolute(cwd, bc_target);
+        let mut bc_file = std::fs::File::open(&bc_path)?;
+        bc_file.read_to_end(&mut bc_content)?;
+        hasher.update(bc_content);
+        let hash = hasher.finalize();
+        hex::encode(hash.as_slice())
+    };
 
-    // This temporary file is filled in by `build_bitcode_tar`; however, we
-    // allocate it here so that it is still in scope (i.e., not deleted) when we
-    // invoke `inject_bitcode`
-    let mut tar_file = tempfile::NamedTempFile::new()?;
-    build_bitcode_tar(bc_target, bc_path.as_path(), hash.as_slice(), &mut tar_file)?;
+    let mktar = bc_args.ops.push_call(
+        &FunctionOperation::calling(
+            "tar-of-bitfile",
+            move |_cwd, inpfs, outf| {
+                let tfpath = outf.to_path("tar", "output_tarfile")?;
+                let tarfile = File::create(tfpath)?;
+                for inp_path in inpfs.to_paths("tar", "input_bc_file")? {
+                    build_bitcode_tar(&reprname.clone().into_os_string(),
+                                      inp_path.as_path(),
+                                      &hash_str.clone().into(),
+                                      &tarfile)?
+                }
+                Ok(())
+            }));
 
-    let tar_name = OsString::from(tar_file.path());
-    let ok_tar_name = tar_name.into_string().ok().unwrap();
-    let opath = object_path.into_os_string();
-    inject_bitcode(chan, cwd, orig_target, bc_target, &ok_tar_name, &opath)
+    // Define the args in the order that matches the args in the calling() above.
+    mktar.set_input(&NamedFile::temp(""));
+    mktar.set_output(&NamedFile::temp(".tar"));
+
+    inject_bitcode(bc_opts, bc_args)
 }
 
 pub const ELF_SECTION_NAME : &str = ".llvm_bitcode";
-
-/// Attempt to invoke objcopy to see what version it is (to report failures)
-///
-/// Note that ideally we will switch to using and ELF reader/writer library instead.
-fn get_objcopy_version_info() -> String {
-    match process::Command::new("objcopy")
-        .arg("--version")
-        .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
-        .spawn() {
-            Ok(child) => {
-                let ver = child.wait_with_output()
-                    .expect("Unable to get objcopy --version output");
-                if !ver.status.success() {
-                    format!("objcopy failed to return version\n{:?}\nErr: {:?}",
-                            ver.stdout, ver.stderr)
-                } else {
-                    format!("{:?}\nErr: {:?}", ver.stdout, ver.stderr)
-                }
-            }
-            Err(vermsg) => {
-                format!("objcopy --version run failed: {}", vermsg)
-            }
-        }
-}
-
 
 struct SummaryStats {
     num_pipe_io : usize,
@@ -660,6 +863,15 @@ fn print_summary(summary : SummaryStats) {
     println!(" {} successful bitcode captures", summary.bitcode_captures);
     println!(" last bitcode capture: {:?}", summary.last_capture_file.map_or("<none>".into(),
                                                                              |f| f.into_os_string()));
+}
+
+impl SummaryStats {
+    fn has_failures(&self) -> bool {
+        self.build_failures_skipping_bitcode > 0 ||
+            self.build_failures_unknown_effect > 0 ||
+            self.bitcode_compile_errors > 0 ||
+            self.bitcode_attach_errors > 0
+    }
 }
 
 fn collect_events(stream_errors : bool, chan : mpsc::Receiver<Option<Event>>) -> SummaryStats {
@@ -720,20 +932,11 @@ fn collect_events(stream_errors : bool, chan : mpsc::Receiver<Option<Event>>) ->
                             println!("Skipping bitcode generation for assemble-only command '{:?} {:?}'", cmd.bin, cmd.args);
                         }
                     }
-                    Event::BitcodeCompileError(cmd, args, stdout, stderr, exit_code) => {
+                    Event::BitcodeGenerationError(on_file, err) => {
                         summary.bitcode_compile_errors += 1;
                         if stream_errors {
-                            println!("Error while compiling bitcode ('{:?} {:?}' = {:?})", cmd, args, exit_code);
-                            println!("  stdout: {}", String::from_utf8_lossy(&stdout).into_owned());
-                            println!("  stderr: {}", String::from_utf8_lossy(&stderr).into_owned());
-                        }
-                    }
-                    Event::BitcodeAttachError(cmd, args, stdout, stderr, exit_code) => {
-                        summary.bitcode_attach_errors += 1;
-                        if stream_errors {
-                            println!("Error while attaching bitcode ('{:?} {:?}' = {:?})", cmd, args, exit_code);
-                            println!("  stdout: {}", String::from_utf8_lossy(&stdout).into_owned());
-                            println!("  stderr: {}", String::from_utf8_lossy(&stderr).into_owned());
+                            println!("Error while generating bitcode for {:?}: {}",
+                                     on_file, err);
                         }
                     }
                     Event::BitcodeGenerationAttempts => {
@@ -755,7 +958,7 @@ fn collect_events(stream_errors : bool, chan : mpsc::Receiver<Option<Event>>) ->
 /// This is the saved version that we attempt to postprocess to see if we need
 /// to generate bitcode for it
 #[derive(Debug,Clone)]
-pub struct RunCommand {
+pub struct RunCommand {   // KWQ hmmm, close to a SubProcOperation...
     bin : OsString,
     args : Vec<OsString>,
     env : Vec<u8>,
@@ -864,19 +1067,30 @@ fn handle_process_exit(chan : &mut mpsc::Sender<Option<Event>>,
 struct CompileModifiers {
     /// Corresponding to specifying pipe IO either for an input or output (passing -)
     is_pipe_io : bool,
+
     /// Corresponding to the command line being specified with a response file (filename prefixed with @)
     is_response_file : bool,
+
     /// Corresponding to the compile command including -S to generate an assembly file instead of an object file
     is_assemble_only : bool,
-    /// Corresponding to the -E preprocess only flag
-    is_pre_proc_only : bool
+
+    /// Corresponding to the -E preprocess only flag.  Note that this is a subset
+    /// of is_non_generative, but kept for analytical reasons.
+    is_pre_proc_only : bool,
+
+    /// Compiler invocation does not actually generate any code output.  For
+    /// example, "gcc --version".
+    is_non_generative : bool,
+
+    // Source language determination -- KWQ: todo full argument analysis
 }
 
 fn extract_compile_modifiers(rc : &RunCommand) -> CompileModifiers {
     let mut mods = CompileModifiers { is_pipe_io : false,
                                       is_response_file : false,
                                       is_assemble_only : false,
-                                      is_pre_proc_only : false
+                                      is_pre_proc_only : false,
+                                      is_non_generative : false,
     };
 
     for arg in &rc.args {
@@ -905,21 +1119,117 @@ fn extract_compile_modifiers(rc : &RunCommand) -> CompileModifiers {
         // We would ideally like to handle response files, but we can't yet.
         // For now, we'll have to ignore them.
         mods.is_response_file = mods.is_response_file || arg.to_str().unwrap().starts_with("@");
+
+        // Some configurations do not generate output, and thus there is no
+        // bitcode to extract
+        mods.is_non_generative =
+            mods.is_non_generative || arg_is_non_generative(arg, &rc.args.len());
+
+        // Oddly, "clang -c -emit-llvm -o foo.bc foo.s" results in the foo.bc
+        // file containing post-preprocessor form of foo.s, and *not* bitcode,
+        // so if it looks like and assembly source file, skip it.
+        if !arg.to_str().unwrap().starts_with("-")
+            && arg.to_str().unwrap().ends_with(".s") {
+                mods.is_assemble_only = true;
+            }
     }
 
     mods
 }
 
-/// Returns true if we should make bitcode given this command
-fn should_make_bc(rc : &RunCommand, comp_mods : &CompileModifiers) -> bool {
+
+fn arg_is_non_generative(arg: &OsString, num_args: &usize) -> bool {
+    arg == "--version"  // even "gcc --version -o foo foo.c" is non-gen
+
+    // Ugh:
+    //  gcc -v   # non-generative config info
+    //  gcc -v --version [..anything and everything]
+    //           # non-generative, but invokes sub-commands with -v
+    //  gcc -v -o foo foo.c  # generative of foo, echoing sub-commands
+    //
+    //  clang -v  # non-generative config info
+    //  clang -v [..anything and everything] # non-generative config info
+    //
+        || (arg == "-v" && *num_args == 2)  // just $ cmd -v
+
+    // This is actually generating llvm IR bitcode... but it's not an
+    // actual compilation, so it is ignored.  This may be a separate
+    // bitcode-capture operation, but this flag suppresses object
+    // code generation so it can be ignored: build-bom only captures during
+    // actual object code generation.
+    //
+        || arg == "-emit-llvm"
+
+    // All of these are equivalent and instruct gcc to print the name of
+    // the subprogram invoked and ignore all other args.
+    //
+    //  gcc -print-prog-name=ld
+    //  gcc --print-prog-name=ld
+    //  gcc --print-prog-name ld
+    //
+        || arg.to_str().unwrap().starts_with("--print-prog-name")
+        || arg.to_str().unwrap().starts_with("-print-prog-name=")
+
+    // These also ignore all other args and just dump the requested info
+        || arg == "-print-search-dirs"
+        || arg == "--print-search-dirs"
+}
+
+
+/// Returns true if we should make bitcode given this command.  May write to the
+/// event channel on failure.
+fn should_make_bc(rc : &RunCommand, comp_mods : &CompileModifiers,
+                  chan : &mut mpsc::Sender<Option<Event>>
+) -> bool {
     let cmd_path = Path::new(&rc.bin);
     match cmd_path.file_name() {
-        None => { false }
+        None => { false }  // TODO: event for this
         Some(cmd_file_name) => {
-            clang_support::is_compile_command_name(cmd_file_name) && // Is this a compile command we recognize
-                !comp_mods.is_pipe_io &&                             // Pipe input can't be re-processed a second time (so generating bitcode would fail; the pipe is already drained)
-                !comp_mods.is_assemble_only &&                       // In an assemble-only build, there is no object file to attach the bitcode to
-                !comp_mods.is_pre_proc_only                          // Similarly, in a preprocess only build we have no object file to attach bitcode to
+            // n.b. ignore chan.send failures below: shouldn't happen and only
+            // for stats collection anyhow, so don't let it kill this tracer
+            // thread.
+
+            // Is this a compile command we recognize?
+            if !clang_support::is_compile_command_name(cmd_file_name) {
+                return false;  // nope: just ignore it quietly
+            }
+
+            // Pipe input can't be re-processed a second time (so generating
+            // bitcode would fail; the pipe is already drained)
+            if comp_mods.is_pipe_io {
+                let _res = chan.send(Some(Event::PipeInputOrOutput(rc.clone())));
+                return false;
+            }
+
+            // In an assemble-only build, there is no object file to attach the
+            // bitcode to.
+            if comp_mods.is_assemble_only {
+                let _res = chan.send(Some(Event::SkippingAssembleOnlyCommand(rc.clone())));
+                return false;
+            }
+
+            // In a preprocess only build we have no object file to attach
+            // bitcode to.
+            if comp_mods.is_pre_proc_only {
+                // TODO: event for this
+                return false;
+            }
+
+            // This compilation command doesn't generate machine-code output
+            if comp_mods.is_non_generative {
+                // TODO: event for this
+                return false;
+            }
+
+            // This compilation command uses a response file: cannot be reliably
+            // read twice since only a file-descriptor is provided and it might
+            // not be seekable.
+            if comp_mods.is_response_file {
+                let _res = chan.send(Some(Event::ResponseFile(rc.clone())));
+                return false;
+            }
+
+            true
         }
     }
 }
@@ -930,8 +1240,9 @@ fn post_process_actions(rc : RunCommand,
                         chan : &mut mpsc::Sender<Option<Event>>,
                         bc_opts : &BCOpts
 ) {
+    // eprintln!(">>> postproc: {:?} {:?}", rc.bin, rc.args);
     let comp_mods = extract_compile_modifiers(&rc);
-    if should_make_bc(&rc, &comp_mods) {
+    if should_make_bc(&rc, &comp_mods, chan) {
         // If this is a command we can build bitcode for, do
         // it.  We wait until the exec'd process exits
         // because we need the original object file to exist
@@ -940,28 +1251,9 @@ fn post_process_actions(rc : RunCommand,
         // We drop the first argument because it is just the
         // original command name (i.e., argv[0])
         let (_, rest_args) = rc.args.split_at(1);
-        match build_bitcode_compile_only(chan, bc_opts, rest_args, &rc.cwd) {
+        match build_bitcode_compile_only(chan, bc_opts, rest_args, &rc.bin, &rc.cwd) {
             Err(err) => { println!("Error building bitcode: {:?}", err) }
             Ok(_) => {}
-        }
-    } else {
-        // Bump a summary stat indicating a reason why this compile
-        // could not attempt to generate bitcode.  Ignore
-        // pre-processor-only invocations, since they don't generate
-        // object code anyhow.
-        if !comp_mods.is_pre_proc_only {
-            if comp_mods.is_pipe_io {
-                // Ignore send failures... that really shouldn't happen and
-                // we don't want to kill the tracer thread.
-                let _res = chan.send(Some(Event::PipeInputOrOutput(rc.clone())));
-            }
-            if comp_mods.is_response_file {
-                let _res = chan.send(Some(Event::ResponseFile(rc.clone())));
-            }
-
-            if comp_mods.is_assemble_only {
-                let _res = chan.send(Some(Event::SkippingAssembleOnlyCommand(rc)));
-            }
         }
     }
 }
@@ -1038,4 +1330,281 @@ fn make_command(bin : &RawString, args : &[RawString], env : anyhow::Result<Vec<
 
     let cmd = RunCommand { bin : decode_raw_string(bin)?, args : os_args, env : env?, cwd : cwd? };
     Ok(cmd)
+}
+
+
+#[cfg(test)]
+mod tests {
+
+    use std::sync::mpsc;
+    use super::*;
+
+    #[test]
+    fn test_bitcode_compile_args() -> anyhow::Result<()> {
+        let (mut sender, receiver) = mpsc::channel();
+        let mut bcdir = PathBuf::new();
+        bcdir.push("path");
+        bcdir.push("to");
+        bcdir.push("bitcode");
+        let bcopts = BCOpts { clang_executable: &clang_bitcode().set_exe("/path/to/clang"),
+                              // objcopy_path: &"/path/to/objcopy".into(),
+                              add_elf_section_executable : &Executable::new("objcopy", ExeFileSpec::Append, ExeFileSpec::Append),
+                              suppress_automatic_debug: false,
+                              inject_arguments: &Vec::from(
+                                  [ "-arg1",
+                                      "-arg2",
+                                      "arg2val"
+                                  ].map(|s| String::from(s))),
+                              remove_arguments: &regex::RegexSet::new(
+                                  [r"^-remove$", r"^--this" ],
+
+                              ).unwrap(),
+                              strict: false,
+                              native_preproc: false,
+                              echo_verbose: true};
+
+        // Simple cmdline specification
+        let args = [ "-g", "-O1", "-o", "foo.obj",
+                       "-march=mips",
+                       "-I", "src/include",
+                       "-DDebug"
+                   ].map(|s| s.into());
+        let bcargs0 = build_bitcode_arguments(&mut sender, &bcopts,
+                                              &OsString::from("gcc"), &args);
+        match bcargs0 {
+            Err(e) => assert_eq!(e.to_string(), "<no error expected>"),
+            Ok(a) => {
+                // This isn't a great way to check the contents of a
+                // ChainedSubOp, but since the alternative is exposing a lot more
+                // of the internals through the API, it's probably good enough.
+                assert_eq!(format!("{:?}", a.ops),
+                           "ChainedSubProcOperations \
+                            { chain: [\
+                                Exec(SubProcOperation \
+                                { exec: Executable { exe_file: \"gcc\", \
+                                                     base_args: [], \
+                                                     inp_file: \"append\", \
+                                                     out_file: \"option(-o)\" }, \
+                                  args: [\"-E\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-I\", \"src/include\", \
+                                         \"-DDebug\"], \
+                                  files: \"transforming TBD into Temp(\\\".c\\\") in None\" \
+                                }), \
+                                Exec(SubProcOperation \
+                                { exec: Executable { exe_file: \"/path/to/clang\", \
+                                                     base_args: [\"-c\", \
+                                                                 \"-emit-llvm\"\
+                                                                ], \
+                                                     inp_file: \"append\", \
+                                                     out_file: \"option(-o)\" }, \
+                                  args: [\"-c\", \
+                                         \"-emit-llvm\", \
+                                         \"-g\", \
+                                         \"-O0\", \
+                                         \"-Wno-error=unused-command-line-argument\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-I\", \"src/include\", \
+                                         \"-DDebug\"], \
+                                  files: \"transforming TBD into Temp(\\\".bc\\\") in None\" \
+                                })], \
+                              initial_inp_file: None, \
+                              final_out_file: Some(\"foo.obj\"), \
+                              disabled: [0] \
+                            }");
+                assert_eq!(a.resolved_object_target, "foo.obj");
+                let chan_out = receiver.try_recv();
+                assert!(chan_out.is_err());
+                assert_eq!(chan_out.err(), Some(mpsc::TryRecvError::Empty));
+            }
+        }
+
+        // Simple cmdline specification, strict bitcode
+        let bcopts_strict = BCOpts { strict: true, native_preproc: true, ..bcopts };
+        let bcargs1 = build_bitcode_arguments(&mut sender, &bcopts_strict,
+                                              &OsString::from("c"), &args);
+        match bcargs1 {
+            Err(e) => assert_eq!(e.to_string(), "<no error expected>"),
+            Ok(a) => {
+                assert_eq!(format!("{:?}", a.ops),
+                           "ChainedSubProcOperations \
+                            { chain: [\
+                                Exec(SubProcOperation \
+                                { exec: Executable { exe_file: \"c\", \
+                                                     base_args: [], \
+                                                     inp_file: \"append\", \
+                                                     out_file: \"option(-o)\" }, \
+                                  args: [\"-E\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-O1\", \
+                                         \"-march=mips\", \
+                                         \"-I\", \"src/include\", \
+                                         \"-DDebug\"], \
+                                  files: \"transforming TBD into Temp(\\\".c\\\") in None\" \
+                                }), \
+                                Exec(SubProcOperation \
+                                { exec: Executable { exe_file: \"/path/to/clang\", \
+                                                     base_args: [\"-c\", \
+                                                                 \"-emit-llvm\"\
+                                                                ], \
+                                                     inp_file: \"append\", \
+                                                     out_file: \"option(-o)\" }, \
+                                  args: [\"-c\", \
+                                         \"-emit-llvm\", \
+                                         \"-g\", \
+                                         \"-Wno-error=unused-command-line-argument\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-O1\", \
+                                         \"-march=mips\", \
+                                         \"-I\", \"src/include\", \
+                                         \"-DDebug\"], \
+                                  files: \"transforming TBD into Temp(\\\".bc\\\") in None\" \
+                                })], \
+                              initial_inp_file: None, \
+                              final_out_file: Some(\"foo.obj\"), \
+                              disabled: [] \
+                            }");
+                assert_eq!(a.resolved_object_target, "foo.obj");
+                let chan_out = receiver.try_recv();
+                assert!(chan_out.is_err());
+                assert_eq!(chan_out.err(), Some(mpsc::TryRecvError::Empty));
+            }
+        }
+
+        // Simple cmdline specification, non-strict, native preprocessing
+        let bcopts_preproc = BCOpts { native_preproc: true, ..bcopts };
+        let bcargs2 = build_bitcode_arguments(&mut sender, &bcopts_preproc,
+                                              &OsString::from("c"), &args);
+        match bcargs2 {
+            Err(e) => assert_eq!(e.to_string(), "<no error expected>"),
+            Ok(a) => {
+                assert_eq!(format!("{:?}", a.ops),
+                           "ChainedSubProcOperations \
+                            { chain: [\
+                                Exec(SubProcOperation \
+                                { exec: Executable { exe_file: \"c\", \
+                                                     base_args: [], \
+                                                     inp_file: \"append\", \
+                                                     out_file: \"option(-o)\" }, \
+                                  args: [\"-E\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-I\", \"src/include\", \
+                                         \"-DDebug\"], \
+                                  files: \"transforming TBD into Temp(\\\".c\\\") in None\" \
+                                }), \
+                                Exec(SubProcOperation \
+                                { exec: Executable { exe_file: \"/path/to/clang\", \
+                                                     base_args: [\"-c\", \
+                                                                 \"-emit-llvm\"\
+                                                                ], \
+                                                     inp_file: \"append\", \
+                                                     out_file: \"option(-o)\" }, \
+                                  args: [\"-c\", \
+                                         \"-emit-llvm\", \
+                                         \"-D__malloc__(X,Y)=\", \
+                                         \"-D__atomic_store(X,Y,Z)=\", \
+                                         \"-D__atomic_fetch_add(X,Y,Z)=0\", \
+                                         \"-D__atomic_fetch_sub(X,Y,Z)=0\", \
+                                         \"-D__atomic_fetch_and(X,Y,Z)=0\", \
+                                         \"-D__atomic_fetch_or(X,Y,Z)=0\", \
+                                         \"-D__atomic_compare_exchange(A,B,C,D,E,F)=0\", \
+                                         \"-D__atomic_exchange(A,B,C,D)=0\", \
+                                         \"-D__atomic_load(A,B,C)=0\", \
+                                         \"-g\", \
+                                         \"-O0\", \
+                                         \"-Wno-error=unused-command-line-argument\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-g\", \
+                                         \"-I\", \"src/include\", \
+                                         \"-DDebug\"], \
+                                  files: \"transforming TBD into Temp(\\\".bc\\\") in None\" \
+                                })], \
+                              initial_inp_file: None, \
+                              final_out_file: Some(\"foo.obj\"), \
+                              disabled: [] \
+                            }");
+                assert_eq!(a.resolved_object_target, "foo.obj");
+                let chan_out = receiver.try_recv();
+                assert!(chan_out.is_err());
+                assert_eq!(chan_out.err(), Some(mpsc::TryRecvError::Empty));
+            }
+        }
+
+        // Alternate cmdline specification
+        let bcargs3 = build_bitcode_arguments(&mut sender, &bcopts,
+                                              &OsString::from("clang"),
+                                              &[ "-ofoo.obj",
+                                                   "-remove",
+                                                   "-O",
+                                                   "--this=remove-also",
+                                                   "-DDebug",
+                                                   "bar.cc"
+                                              ].map(|s| s.into()));
+        match bcargs3 {
+            Err(e) => assert_eq!(e.to_string(), "<no error expected>"),
+            Ok(a) => {
+                assert_eq!(format!("{:?}", a.ops),
+                           "ChainedSubProcOperations \
+                            { chain: [\
+                                Exec(SubProcOperation \
+                                { exec: Executable { exe_file: \"clang\", \
+                                                     base_args: [], \
+                                                     inp_file: \"append\", \
+                                                     out_file: \"option(-o)\" }, \
+                                  args: [\"-E\", \
+                                         \"-Wno-error=unused-command-line-argument\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-DDebug\"], \
+                                  files: \"transforming TBD into Temp(\\\".cc\\\") in None\" \
+                                }), \
+                                Exec(SubProcOperation \
+                                { exec: Executable { exe_file: \"/path/to/clang\", \
+                                                     base_args: [\"-c\", \
+                                                                 \"-emit-llvm\"\
+                                                                ], \
+                                                     inp_file: \"append\", \
+                                                     out_file: \"option(-o)\" }, \
+                                  args: [\"-c\", \
+                                         \"-emit-llvm\", \
+                                         \"-g\", \
+                                         \"-O0\", \
+                                         \"-Wno-error=unused-command-line-argument\", \
+                                         \"-arg1\", \
+                                         \"-arg2\", \
+                                         \"arg2val\", \
+                                         \"-DDebug\"], \
+                                  files: \"transforming TBD into Temp(\\\".bc\\\") in None\" \
+                                })], \
+                              initial_inp_file: Some(\"bar.cc\"), \
+                              final_out_file: Some(\"foo.obj\"), \
+                              disabled: [0] \
+                            }");
+                assert_eq!(a.resolved_object_target, "foo.obj");
+                let chan_out = receiver.try_recv();
+                assert!(chan_out.is_err());
+                assert_eq!(chan_out.err(), Some(mpsc::TryRecvError::Empty));
+            }
+        }
+
+        Ok(())
+    }
 }

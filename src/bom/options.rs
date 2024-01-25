@@ -3,6 +3,7 @@ use structopt::StructOpt;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::string::ToString;
+use std::ffi::OsString;
 
 #[derive(Debug,StructOpt)]
 #[structopt(version = "1.0", author = "Tristan Ravitch")]
@@ -26,15 +27,19 @@ pub struct ExtractOptions {
     #[structopt(short="o", long="output", help="The file to save the resulting bitcode file to")]
     pub output : PathBuf,
     #[structopt(long="llvm-link-path", help="The path to the llvm-link tool (possibly version suffixed)")]
-    pub llvm_link_path : Option<String>
+    pub llvm_link_path : Option<PathBuf>,
+    #[structopt(long="objcopy", help="Name of the objcopy binary to use to when generating bitcode (default: `objcopy`)")]
+    pub objcopy_path : Option<PathBuf>,
+    #[structopt(short="v", long="verbose", help="Generate verbose output")]
+    pub verbose : bool,
 }
 
 #[derive(Debug,StructOpt)]
 pub struct BitcodeOptions {
     #[structopt(long="clang", help="Name of the clang binary to use to generate bitcode (default: `clang`)")]
     pub clang_path : Option<PathBuf>,
-    #[structopt(short="b", long="bc-out", help="Directory to place LLVM bitcode (bc) output data.  The default is to place it next to the object file, but it must be accessible by a subsequent Extract operation and some build tools build in a temporary directory that is disposed of at the end of the build (e.g. CMake) ")]
-    pub bcout_path : Option<PathBuf>,
+    #[structopt(long="objcopy", help="Name of the objcopy binary to use to when generating bitcode (default: `objcopy`)")]
+    pub objcopy_path : Option<PathBuf>,
     #[structopt(short="v", long="verbose", help="Generate verbose output")]
     pub verbose : bool,
     #[structopt(long="suppress-automatic-debug", help="Prevent `build-bom` from automatically injecting flags to generate debug information in bitcode files")]
@@ -44,7 +49,20 @@ pub struct BitcodeOptions {
     #[structopt(long="remove-argument", help="Have `build-bom` remove arguments matching the given regular expression when generating bitcode")]
     pub remove_arguments : Vec<Regex>,
     #[structopt(last = true, help="The build command to run")]
-    pub command : Vec<String>
+    pub command : Vec<String>,
+    #[structopt(long="strict", help="Generate bitcode that strictly adheres to the target object code (optimization levels, target architecture, etc.).")]
+    pub strict : bool,
+    #[structopt(long="preproc-native", short="E", help="Pre-process with native compiler before generating bitcode.  This can be helpful for customized native compilers.")]
+    pub preproc_native : bool,
+
+    // The following is for testing only: if set, it will fail if any portion of
+    // the generate_bitcode operations fail.  In normal operation, this is false
+    // which means that the build-bom operation proceeds as long as the main
+    // compilation attempt is successful (i.e. any errors during bitcode
+    // generation are logged and counted but do not cause an overall failure
+    // result).
+    #[structopt(skip)]
+    pub any_fail : bool
 }
 
 #[derive(Debug,StructOpt)]
@@ -154,4 +172,9 @@ pub enum StringNormalizeStrategy {
 
 impl Default for StringNormalizeStrategy {
     fn default () -> Self { StringNormalizeStrategy ::Strict }
+}
+
+pub fn path_def(p: &Option<PathBuf>, d: &str) -> OsString  // KWQ: if set, .set_exe on the  input Executable...
+{
+    p.as_ref().map(OsString::from).unwrap_or(d.into())
 }

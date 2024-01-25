@@ -1,91 +1,114 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::Command;
 
-use crate::bom::options::ExtractOptions;
+use crate::bom::options::{ExtractOptions, path_def};
 use crate::bom::bitcode::ELF_SECTION_NAME;
-
-#[derive(thiserror::Error,Debug)]
-pub enum ExtractError {
-    #[error("Error running command {0:} {1:?} ({2:?})")]
-    ErrorRunningCommand(String,Vec<OsString>,std::io::Error)
-}
+use crate::bom::chainsop::{ChainedSubOps, NamedFile, SubProcOperation, Executable, ExeFileSpec, OpInterface, FilesPrep};
 
 pub fn extract_bitcode_entrypoint(extract_options : &ExtractOptions) -> anyhow::Result<i32> {
     let tmp_dir = tempfile::TempDir::new()?;
-    let mut tar_path = PathBuf::new();
-    tar_path.push(tmp_dir.path());
-    tar_path.push("bitcode.tar");
 
-    // Use objcopy to extract our tar file from the target
-    let mut objcopy_args = Vec::new();
-    objcopy_args.push(OsString::from("--dump-section"));
-    let ok_tar_name = OsString::from(tar_path).into_string().unwrap();
-    objcopy_args.push(OsString::from(format!("{}={}", ELF_SECTION_NAME, ok_tar_name)));
-    objcopy_args.push(OsString::from(&extract_options.input));
-    match Command::new("objcopy").args(&objcopy_args).spawn() {
-        Err(msg) => {
-            return Err(anyhow::Error::new(ExtractError::ErrorRunningCommand(String::from("objcopy"), objcopy_args, msg)));
-        }
-        Ok(mut child) => {
-            match child.wait() {
-                Err(msg) => {
-                    return Err(anyhow::Error::new(ExtractError::ErrorRunningCommand(String::from("objcopy"), Vec::new() /*objcopy_args*/, msg)));
-                }
-                Ok(sts) => {
-                    if !sts.success() {
-                        match sts.code() {
-                            Some(rc) => { return Ok(rc) }
-                            None => { return Ok(-1) }
-                        }
-                    }
-                }
-            }
-        }
+    // Create a sub-context to ensure the tmp_dir remains during the entirety of
+    // the enclosed operations...
+    {
+        // Name of the tar file we will extract from the input file's ELF
+        // section.
+        let mut tar_path = PathBuf::new();
+        tar_path.push(tmp_dir.path());
+        tar_path.push("bitcode.tar");
+
+        let extract_ops = ChainedSubOps::new();
+        extract_ops.set_out_file_for_chain(&Some(extract_options.output.clone()));
+
+        // Use objcopy to extract our tar file from the target.  Note that
+        // objcopy expects to write an output object.  If not given an output
+        // file, it will try to replace the input file with the generated version
+        // by copying the input file to a temporary file (adjacent to the input
+        // file) and then reading that temporary file to rewriting the input file
+        // with the output data.
+        //
+        // This is not necessarily a problem for the use of objcopy during the
+        // generate-bitcode phase, but extraction may be performed from installed
+        // targets where the current user does not have permissions to create a
+        // temporary file adjacent to the installed target.
+        //
+        // The most obvious solution is to supply /dev/null as the output file:
+        // then the input file is not copied to an adjacent location and the
+        // objcopy can run as needed.  This works... except for when the input
+        // file is an archive (a.k.a static library file, as in libxyz.a).  When
+        // the input file is an archive file, then objcopy appears to create a
+        // temporary output file for each member of the archive and then
+        // re-combine those into the output archive file.  The problem is that
+        // the temporary output files are adjacent to the provided output file,
+        // thus when /dev/null is provided as the output file, objcopy with an
+        // archive input will try to write to /dev/{tempfile}, which fails.
+        //
+        // Thus the more robust solution is to specify the (ignored) output file
+        // in the standard temporary directory so that objcopy-created files next
+        // to it are in a valid temporary location.
+
+        let extract_elf_section =
+            Executable::new("objcopy",
+                            ExeFileSpec::Append,
+                            ExeFileSpec::Append);
+        let user_objcopy = match extract_options.objcopy_path { // KWQ::  use options.rs path_def after adjustment
+            None => extract_elf_section,
+            Some(ref p) => extract_elf_section.set_exe(p)
+        };
+
+        let ok_tar_name = OsString::from(&tar_path).into_string().unwrap();
+
+        let objcopy = extract_ops.push_op(
+            &SubProcOperation::for_(&user_objcopy)
+                .push_arg("--dump-section")
+                .push_arg(format!("{}={}", ELF_SECTION_NAME, ok_tar_name))
+        );
+        objcopy.set_input(&NamedFile::actual(&extract_options.input)); //  KWQ:: inpt_for_chain?!
+        objcopy.set_output(&NamedFile::temp(".o"));
+
+        // The tar file containing all of our bitcode is now in
+        // /tmp/{random}/bitcode.tar
+        //
+        // We can extract it in that directory.  Note that we need to use tar -i
+        // because we concatenated a number of tar files together.
+        //
+        // NOTE: Ideally, we would be able to use the tar library for this
+        // instead of calling out to tar.
+
+
+        let tar = extract_ops.push_op(
+            &SubProcOperation::for_(
+                &Executable::new("tar",
+                                 ExeFileSpec::NoFileUsed,
+                                 ExeFileSpec::NoFileUsed)
+            )
+            // normally chainsop would set the output of the previous operation
+            // as the input of this tar operation, but that would be the fake .o
+            // file that objcopy needed and not the tar file created as a side
+            // effect, so specify that known input tarfile manually here as a
+            // regular argument.
+                .push_arg("xif")
+                .push_arg(&tar_path)
+                .set_dir(&tmp_dir)
+        );
+
+        // Now all the files contained in the extracted bitcode.tar should be
+        // linked together to create the final bitcode file.
+
+        let llvm_link = path_def(&extract_options.llvm_link_path, "llvm-link");
+        extract_ops.push_op(
+            &SubProcOperation::for_(
+                &Executable::new(&llvm_link,
+                                 ExeFileSpec::Append,
+                                 ExeFileSpec::option("-o")))
+                .set_input_file(&NamedFile::glob_in(tmp_dir.path(), "*.bc"))
+        );
+
+        let mut bc_glob = String::new();
+        bc_glob.push_str(&OsString::from(tmp_dir.path()).into_string().unwrap());
+        bc_glob.push_str("/*.bc");
+
+        extract_ops.execute::<String>(&None, extract_options.verbose)?;
+        Ok(0)
     }
-
-    // The tar file containing all of our bitcode is now in /tmp/{random}/bitcode.tar
-    //
-    // We can extract it in that directory.  Note that we need to use tar -i because we
-    // concatenated a number of tar files together.
-    //
-    // NOTE: Ideally, we would be able to use the tar library for this instead
-    // of calling out to tar.
-    let mut tar_args = Vec::new();
-    tar_args.push(OsString::from("xif"));
-    tar_args.push(OsString::from(ok_tar_name));
-    match Command::new("tar").args(&tar_args).current_dir(&tmp_dir).spawn() {
-        Err(msg) => {
-            return Err(anyhow::Error::new(ExtractError::ErrorRunningCommand(String::from("tar"), tar_args, msg)));
-        }
-        Ok(mut child) => {
-            let _rc = child.wait();
-        }
-    }
-
-    let mut llvm_link_args = Vec::new();
-    llvm_link_args.push(OsString::from("-o"));
-    llvm_link_args.push(OsString::from(&extract_options.output));
-
-    let mut bc_glob = String::new();
-    bc_glob.push_str(&OsString::from(tmp_dir.path()).into_string().unwrap());
-    bc_glob.push_str("/*.bc");
-    let bc_files = glob::glob(&bc_glob)?;
-    for bc_entry in bc_files {
-        let bc_file = bc_entry?;
-        llvm_link_args.push(OsString::from(bc_file));
-    }
-
-    let llvm_link = OsString::from(extract_options.llvm_link_path.as_ref().unwrap_or(&String::from("llvm-link")));
-    match Command::new(&llvm_link).args(&llvm_link_args).spawn() {
-        Err(msg) => {
-            let llvm_link_str = llvm_link.into_string().unwrap();
-            return Err(anyhow::Error::new(ExtractError::ErrorRunningCommand(llvm_link_str, llvm_link_args, msg)));
-        }
-        Ok(mut child) => {
-            let _rc = child.wait();
-        }
-    }
-
-    Ok(0)
 }

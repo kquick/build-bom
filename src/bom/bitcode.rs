@@ -79,6 +79,7 @@ use anyhow::{bail, Context};
 use log::{debug, warn, error};
 use regex::RegexSet;
 use std::collections::HashMap;
+use std::env;
 use std::path::{Path,PathBuf};
 use std::io::{Read,Write};
 use std::ffi::{OsString};
@@ -140,6 +141,14 @@ pub fn bitcode_entrypoint(bitcode_options : &BitcodeOptions) -> anyhow::Result<i
 
     let (cmd0, args0) = bitcode_options.command.split_at(1);
     let cmd_path = which::which(OsString::from(&cmd0[0]))?;
+
+    // Some build environments use response files by default.  In particular, the
+    // `nix`-installed compilers have a wrapper that does so.  A response file is
+    // currently not traceable by build-bom, and its use should have no effect on
+    // the build (except in extreme cases where the build line would be too
+    // long).  Here, try to disable any known uses of response files for the
+    // build about to be attempted.
+    env::set_var("NIX_CC_USE_RESPONSE_FILE", "0");
 
     let mut cmd = Command::new(cmd_path.clone());
     cmd.args(args0);
